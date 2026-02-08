@@ -324,16 +324,10 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
         )
         .await?;
 
-        // Log the text portion of the response before potentially executing a command
+        // Log the LLM response before potentially executing a command
         if let Some(path) = config.log_path {
-            let text_part = if let Some(cmd_line) = response.lines().find(|l| is_command_line(l)) {
-                let offset = response.find(cmd_line).unwrap_or(response.len());
-                response[..offset].trim()
-            } else {
-                response.trim()
-            };
-            if !text_part.is_empty() {
-                append_to_log(path, "llm", text_part);
+            if !response.trim().is_empty() {
+                append_to_log(path, "llm", response.trim());
             }
         }
 
