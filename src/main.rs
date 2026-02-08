@@ -376,20 +376,21 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
         append_to_log(path, "user", config.initial_prompt);
     }
 
-    let mut current_prompt = apply_reminders(
-        config.initial_prompt,
-        config.reminders,
-        config.is_new_session,
-    );
-
+    let mut current_turn_prompt = config.initial_prompt.to_string();
     let mut remaining_commands = config.command_per_response;
 
     loop {
+        let prompted_input = apply_reminders(
+            &current_turn_prompt,
+            config.reminders,
+            config.is_new_session,
+        );
+
         let response = generate_internal(
             config.client,
             config.url,
             config.model,
-            &current_prompt,
+            &prompted_input,
             config.session,
             true,
             config.log_path,
@@ -411,7 +412,7 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
                     error: Some("Command execution limit exceeded per response.".to_string()),
                 };
 
-                current_prompt = serde_json::to_string(&error_result).unwrap_or_else(|_| {
+                current_turn_prompt = serde_json::to_string(&error_result).unwrap_or_else(|_| {
                     "{\"error\": \"Failed to serialize limit error\"}".to_string()
                 });
 
@@ -451,7 +452,7 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
                             append_to_log(path, "tool", &result);
                         }
 
-                        current_prompt = result_json;
+                        current_turn_prompt = result_json;
                     }
 
                     Err(e) => {
@@ -467,7 +468,7 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
                             append_to_log(path, "tool", &error_result);
                         }
 
-                        current_prompt =
+                        current_turn_prompt =
                             serde_json::to_string(&error_result).unwrap_or_else(|_| {
                                 "{\"error\": \"Failed to serialize parse error\"}".to_string()
                             });
@@ -617,6 +618,37 @@ mod tests {
 
         let response = "!!!OCHA_RUN_CMD{\"binary\": \"ls\"} some trailing text";
         assert_eq!(extract_command(response), Some("{\"binary\": \"ls\"}"));
+    }
+
+    #[test]
+    fn test_apply_reminders() {
+        let reminders = vec![
+            Reminder {
+                probability: 1.0,
+                prompt: "[PRE]".to_string(),
+                timing: Timing::Pre,
+                init: false,
+            },
+            Reminder {
+                probability: 1.0,
+                prompt: "[POST]".to_string(),
+                timing: Timing::Post,
+                init: false,
+            },
+        ];
+
+        let result = apply_reminders("PROMPT", &reminders, false);
+        assert_eq!(result, "[PRE]PROMPT[POST]");
+
+        // Test init only reminder
+        let reminders_init = vec![Reminder {
+            probability: 1.0,
+            prompt: "[INIT]".to_string(),
+            timing: Timing::Pre,
+            init: true,
+        }];
+        assert_eq!(apply_reminders("P", &reminders_init, true), "[INIT]P");
+        assert_eq!(apply_reminders("P", &reminders_init, false), "P");
     }
 
     #[test]
