@@ -151,10 +151,13 @@ fn apply_reminders(prompt: &str, reminders: &[Reminder], is_new_session: bool) -
     let mut activated = Vec::new();
 
     for reminder in reminders {
-        if reminder.init && !is_new_session {
-            continue;
-        }
-        if rng.random_range(0.0..1.0) < reminder.probability {
+        let should_apply = if reminder.init {
+            is_new_session
+        } else {
+            rng.random_range(0.0..1.0) < reminder.probability
+        };
+
+        if should_apply {
             activated.push(reminder.prompt.clone());
             match reminder.timing {
                 Timing::Pre => pre.push_str(&reminder.prompt),
@@ -663,6 +666,17 @@ mod tests {
         let (res_no_init, act_no_init) = apply_reminders("P", &reminders_init, false);
         assert_eq!(res_no_init, "P");
         assert_eq!(act_no_init.len(), 0);
+
+        // Test init: true with 0 probability always fires on new session
+        let reminders_init_zero = vec![Reminder {
+            probability: 0.0,
+            prompt: "[INIT_ZERO]".to_string(),
+            timing: Timing::Pre,
+            init: true,
+        }];
+        let (res_zero, act_zero) = apply_reminders("P", &reminders_init_zero, true);
+        assert_eq!(res_zero, "[INIT_ZERO]P");
+        assert_eq!(act_zero.len(), 1);
     }
 
     #[test]
