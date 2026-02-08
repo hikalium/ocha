@@ -35,8 +35,41 @@ struct Args {
     #[arg(long, default_value = "5")]
     command_per_response: usize,
 
+    /// Path to a log file to record interactions
+    #[arg(long)]
+    log: Option<PathBuf>,
+
     /// The prompt to send to the model. If omitted, starts interactive mode.
     prompt: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LogEntry {
+    timestamp: String,
+    entity: String,
+    content: serde_json::Value,
+}
+
+fn append_to_log(path: &std::path::Path, entity: &str, content: impl Serialize) {
+    let entry = LogEntry {
+        timestamp: chrono::Local::now().to_rfc3339(),
+        entity: entity.to_string(),
+        content: serde_json::to_value(content).unwrap_or(serde_json::Value::Null),
+    };
+
+    let mut logs: Vec<LogEntry> = if path.exists() {
+        let file = std::fs::File::open(path).ok();
+        file.and_then(|f| serde_json::from_reader(f).ok())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    logs.push(entry);
+
+    if let Ok(file) = std::fs::File::create(path) {
+        let _ = serde_json::to_writer_pretty(file, &logs);
+    }
 }
 
 #[derive(Serialize)]
@@ -263,9 +296,15 @@ struct RunTurnConfig<'a> {
     command_per_response: usize,
 
     is_new_session: bool,
+
+    log_path: Option<&'a std::path::Path>,
 }
 
 async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(path) = config.log_path {
+        append_to_log(path, "user", config.initial_prompt);
+    }
+
     let mut current_prompt = apply_reminders(
         config.initial_prompt,
         config.reminders,
@@ -285,6 +324,19 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
         )
         .await?;
 
+        // Log the text portion of the response before potentially executing a command
+        if let Some(path) = config.log_path {
+            let text_part = if let Some(cmd_line) = response.lines().find(|l| is_command_line(l)) {
+                let offset = response.find(cmd_line).unwrap_or(response.len());
+                response[..offset].trim()
+            } else {
+                response.trim()
+            };
+            if !text_part.is_empty() {
+                append_to_log(path, "llm", text_part);
+            }
+        }
+
         if let Some(cmd_json_str) = extract_command(&response) {
             if remaining_commands == 0 {
                 let error_result = CommandResult {
@@ -298,6 +350,10 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
                 current_prompt = serde_json::to_string(&error_result).unwrap_or_else(|_| {
                     "{\"error\": \"Failed to serialize limit error\"}".to_string()
                 });
+
+                if let Some(path) = config.log_path {
+                    append_to_log(path, "tool", &error_result);
+                }
                 // Continue loop to report error to model
             } else {
                 remaining_commands -= 1;
@@ -320,6 +376,11 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
                             remaining_commands,
                             error,
                         };
+
+                        if let Some(path) = config.log_path {
+                            append_to_log(path, "tool", &result);
+                        }
+
                         current_prompt = serde_json::to_string(&result).unwrap_or_else(|_| {
                             "{\"error\": \"Failed to serialize command result\"}".to_string()
                         });
@@ -333,6 +394,10 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
                             remaining_commands,
                             error: Some(format!("Failed to parse command request: {}", e)),
                         };
+
+                        if let Some(path) = config.log_path {
+                            append_to_log(path, "tool", &error_result);
+                        }
 
                         current_prompt =
                             serde_json::to_string(&error_result).unwrap_or_else(|_| {
@@ -388,6 +453,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             reminders: &reminders,
             command_per_response: args.command_per_response,
             is_new_session: is_new_session_initial,
+            log_path: args.log.as_deref(),
         })
         .await?;
         if let Some(ref path) = args.session {
@@ -429,6 +495,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 reminders: &reminders,
                 command_per_response: args.command_per_response,
                 is_new_session: is_new,
+                log_path: args.log.as_deref(),
             })
             .await?;
 
@@ -476,5 +543,24 @@ mod tests {
 
         let response = "!!!OCHA_RUN_CMD{\"binary\": \"ls\"} some trailing text";
         assert_eq!(extract_command(response), Some("{\"binary\": \"ls\"}"));
+    }
+
+    #[test]
+    fn test_append_to_log() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let log_path = temp_dir.path().join("test.log");
+
+        append_to_log(&log_path, "user", "Hello");
+        append_to_log(&log_path, "llm", "Hi there");
+
+        let content = std::fs::read_to_string(&log_path).unwrap();
+        let logs: Vec<LogEntry> = serde_json::from_str(&content).unwrap();
+
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].entity, "user");
+        assert_eq!(logs[0].content, serde_json::Value::String("Hello".to_string()));
+        assert_eq!(logs[1].entity, "llm");
+        assert_eq!(logs[1].content, serde_json::Value::String("Hi there".to_string()));
+        assert!(!logs[0].timestamp.is_empty());
     }
 }
