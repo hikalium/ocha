@@ -383,13 +383,16 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
 
     let mut current_turn_prompt = config.initial_prompt.to_string();
     let mut remaining_commands = config.command_per_response;
+    let mut is_first_turn = config.is_new_session;
 
     loop {
         let (prompted_input, activated_reminders) = apply_reminders(
             &current_turn_prompt,
             config.reminders,
-            config.is_new_session,
+            is_first_turn,
         );
+
+        is_first_turn = false;
 
         for reminder in activated_reminders {
             println!("[Reminder: {}]", reminder.trim());
@@ -677,6 +680,10 @@ mod tests {
         let (res_zero, act_zero) = apply_reminders("P", &reminders_init_zero, true);
         assert_eq!(res_zero, "[INIT_ZERO]P");
         assert_eq!(act_zero.len(), 1);
+
+        let (res_zero_next, act_zero_next) = apply_reminders("P", &reminders_init_zero, false);
+        assert_eq!(res_zero_next, "P");
+        assert_eq!(act_zero_next.len(), 0);
     }
 
     #[test]
