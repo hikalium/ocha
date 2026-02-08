@@ -289,21 +289,20 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
                 match serde_json::from_str::<CommandRequest>(cmd_json_str) {
                     Ok(req) => {
                         println!("[Executing: {} {}]", req.binary, req.args.join(" "));
-
                         let (status, stdout, stderr, error) = execute_command(req).await;
-
+                        if !stdout.is_empty() {
+                            println!("STDOUT:\n{}", stdout);
+                        }
+                        if !stderr.is_empty() {
+                            println!("STDERR:\n{}", stderr);
+                        }
                         let result = CommandResult {
                             status,
-
                             stdout,
-
                             stderr,
-
                             remaining_commands,
-
                             error,
                         };
-
                         current_prompt = serde_json::to_string(&result)?;
                     }
 
