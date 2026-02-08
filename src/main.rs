@@ -386,6 +386,7 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
                 // Parse JSON
                 match serde_json::from_str::<CommandRequest>(cmd_json_str) {
                     Ok(req) => {
+                        println!("[Payload: {}]", cmd_json_str);
                         println!("[Executing: {} {}]", req.binary, req.args.join(" "));
                         let (status, stdout, stderr, error) = execute_command(req).await;
                         if !stdout.is_empty() {
