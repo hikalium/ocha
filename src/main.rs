@@ -1,5 +1,6 @@
 use clap::Parser;
 use futures_util::StreamExt;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -22,6 +23,10 @@ struct Args {
     /// Path to a session file for persistent context
     #[arg(short = 'S', long)]
     session: Option<PathBuf>,
+
+    /// Path to a reminders JSON file
+    #[arg(short = 'r', long)]
+    reminders: Option<PathBuf>,
 
     /// The prompt to send to the model. If omitted, starts interactive mode.
     prompt: Option<String>,
@@ -48,16 +53,54 @@ struct GenerateResponse {
     context: Option<Vec<i32>>,
 }
 
+#[derive(Deserialize, Debug, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum Timing {
+    Pre,
+    Post,
+}
+
+#[derive(Deserialize, Debug)]
+struct Reminder {
+    probability: f32,
+    prompt: String,
+    timing: Timing,
+}
+
+fn apply_reminders(prompt: &str, reminders: &[Reminder]) -> String {
+    let mut rng = rand::rng();
+    let mut pre = String::new();
+    let mut post = String::new();
+
+    for reminder in reminders {
+        if rng.random_range(0.0..1.0) < reminder.probability {
+            match reminder.timing {
+                Timing::Pre => pre.push_str(&reminder.prompt),
+                Timing::Post => post.push_str(&reminder.prompt),
+            }
+        }
+    }
+
+    format!("{}{}{}", pre, prompt, post)
+}
+
 async fn generate(
     client: &reqwest::Client,
     url: &str,
     model: &str,
     prompt: &str,
     session: &mut Session,
+    reminders: &[Reminder],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let final_prompt = if reminders.is_empty() {
+        prompt.to_string()
+    } else {
+        apply_reminders(prompt, reminders)
+    };
+
     let request_body = GenerateRequest {
         model,
-        prompt,
+        prompt: &final_prompt,
         stream: true,
         context: if session.context.is_empty() {
             None
@@ -74,7 +117,6 @@ async fn generate(
     }
 
     let mut stream = res.bytes_stream();
-    let mut full_response = String::new();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -87,7 +129,6 @@ async fn generate(
             let resp_part: GenerateResponse = serde_json::from_str(line)?;
             print!("{}", resp_part.response);
             io::stdout().flush()?;
-            full_response.push_str(&resp_part.response);
 
             #[allow(clippy::collapsible_if)]
             if resp_part.done {
@@ -119,8 +160,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Session::default()
     };
 
+    let reminders: Vec<Reminder> = if let Some(ref path) = args.reminders {
+        let content = std::fs::read_to_string(path)?;
+        serde_json::from_str(&content)?
+    } else {
+        Vec::new()
+    };
+
     if let Some(prompt) = args.prompt {
-        generate(&client, &url, &args.model, &prompt, &mut session).await?;
+        generate(
+            &client,
+            &url,
+            &args.model,
+            &prompt,
+            &mut session,
+            &reminders,
+        )
+        .await?;
         if let Some(ref path) = args.session {
             let content = serde_json::to_string_pretty(&session)?;
             std::fs::write(path, content)?;
@@ -144,7 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
 
-            generate(&client, &url, &args.model, input, &mut session).await?;
+            generate(&client, &url, &args.model, input, &mut session, &reminders).await?;
 
             if let Some(ref path) = args.session {
                 let content = serde_json::to_string_pretty(&session)?;

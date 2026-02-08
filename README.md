@@ -49,6 +49,22 @@ ocha -S my_chat.json "What is my name?"
 | `-p` | `--port`  | Port of the Ollama server | `11434` |
 | `-m` | `--model` | Model name to use | `gemma3:27b` |
 | `-S` | `--session`| Path to session JSON file | (None) |
+| `-r` | `--reminders`| Path to reminders JSON file | (None) |
+
+### Reminders
+You can inject hidden prompts (e.g., system instructions) based on probability using a reminders file.
+
+**reminders.json example:**
+```json
+[
+  {
+    "probability": 0.5,
+    "prompt": " (Keep your response very brief)",
+    "timing": "post"
+  }
+]
+```
+Usage: `ocha -r reminders.json "Tell me a story."`
 
 ### Examples
 
