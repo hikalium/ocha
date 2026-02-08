@@ -144,16 +144,18 @@ struct CommandResult {
     error: Option<String>,
 }
 
-fn apply_reminders(prompt: &str, reminders: &[Reminder], is_new_session: bool) -> String {
+fn apply_reminders(prompt: &str, reminders: &[Reminder], is_new_session: bool) -> (String, Vec<String>) {
     let mut rng = rand::rng();
     let mut pre = String::new();
     let mut post = String::new();
+    let mut activated = Vec::new();
 
     for reminder in reminders {
         if reminder.init && !is_new_session {
             continue;
         }
         if rng.random_range(0.0..1.0) < reminder.probability {
+            activated.push(reminder.prompt.clone());
             match reminder.timing {
                 Timing::Pre => pre.push_str(&reminder.prompt),
                 Timing::Post => post.push_str(&reminder.prompt),
@@ -161,7 +163,7 @@ fn apply_reminders(prompt: &str, reminders: &[Reminder], is_new_session: bool) -
         }
     }
 
-    format!("{}{}{}", pre, prompt, post)
+    (format!("{}{}{}", pre, prompt, post), activated)
 }
 
 async fn list_models(
@@ -380,11 +382,15 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
     let mut remaining_commands = config.command_per_response;
 
     loop {
-        let prompted_input = apply_reminders(
+        let (prompted_input, activated_reminders) = apply_reminders(
             &current_turn_prompt,
             config.reminders,
             config.is_new_session,
         );
+
+        for reminder in activated_reminders {
+            println!("[Reminder: {}]", reminder.trim());
+        }
 
         let response = generate_internal(
             config.client,
@@ -637,8 +643,11 @@ mod tests {
             },
         ];
 
-        let result = apply_reminders("PROMPT", &reminders, false);
+        let (result, activated) = apply_reminders("PROMPT", &reminders, false);
         assert_eq!(result, "[PRE]PROMPT[POST]");
+        assert_eq!(activated.len(), 2);
+        assert!(activated.contains(&"[PRE]".to_string()));
+        assert!(activated.contains(&"[POST]".to_string()));
 
         // Test init only reminder
         let reminders_init = vec![Reminder {
@@ -647,8 +656,13 @@ mod tests {
             timing: Timing::Pre,
             init: true,
         }];
-        assert_eq!(apply_reminders("P", &reminders_init, true), "[INIT]P");
-        assert_eq!(apply_reminders("P", &reminders_init, false), "P");
+        let (res_init, act_init) = apply_reminders("P", &reminders_init, true);
+        assert_eq!(res_init, "[INIT]P");
+        assert_eq!(act_init.len(), 1);
+
+        let (res_no_init, act_no_init) = apply_reminders("P", &reminders_init, false);
+        assert_eq!(res_no_init, "P");
+        assert_eq!(act_no_init.len(), 0);
     }
 
     #[test]
