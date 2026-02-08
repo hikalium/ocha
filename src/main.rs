@@ -403,13 +403,16 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
                             error,
                         };
 
+                        let result_json = serde_json::to_string(&result).unwrap_or_else(|_| {
+                            "{\"error\": \"Failed to serialize command result\"}".to_string()
+                        });
+                        println!("[Result: {}]", result_json);
+
                         if let Some(path) = config.log_path {
                             append_to_log(path, "tool", &result);
                         }
 
-                        current_prompt = serde_json::to_string(&result).unwrap_or_else(|_| {
-                            "{\"error\": \"Failed to serialize command result\"}".to_string()
-                        });
+                        current_prompt = result_json;
                     }
 
                     Err(e) => {
