@@ -333,7 +333,7 @@ async fn generate_internal(
                     }
                 }
 
-                if stream_output && !is_command_mode {
+                if stream_output {
                     print!("{}", c);
                     io::stdout().flush()?;
                 }
@@ -349,7 +349,7 @@ async fn generate_internal(
         }
     }
 
-    if stream_output && !is_command_mode {
+    if stream_output {
         println!();
     }
 
