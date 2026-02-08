@@ -164,10 +164,14 @@ fn is_command_line(line: &str) -> bool {
 }
 
 fn extract_command(response: &str) -> Option<&str> {
-    response
-        .lines()
-        .find(|l| is_command_line(l))
-        .map(|l| l.trim_start().strip_prefix("!!!OCHA_RUN_CMD").unwrap())
+    response.lines().find(|l| is_command_line(l)).map(|l| {
+        let payload = l.trim_start().strip_prefix("!!!OCHA_RUN_CMD").unwrap();
+        if let Some(last_brace) = payload.rfind('}') {
+            &payload[..=last_brace]
+        } else {
+            payload
+        }
+    })
 }
 
 async fn generate_internal(
@@ -285,24 +289,20 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
             if remaining_commands == 0 {
                 let error_result = CommandResult {
                     status: None,
-
                     stdout: String::new(),
-
                     stderr: String::new(),
-
                     remaining_commands: 0,
-
                     error: Some("Command execution limit exceeded per response.".to_string()),
                 };
 
-                current_prompt = serde_json::to_string(&error_result)?;
-
+                current_prompt = serde_json::to_string(&error_result).unwrap_or_else(|_| {
+                    "{\"error\": \"Failed to serialize limit error\"}".to_string()
+                });
                 // Continue loop to report error to model
             } else {
                 remaining_commands -= 1;
 
                 // Parse JSON
-
                 match serde_json::from_str::<CommandRequest>(cmd_json_str) {
                     Ok(req) => {
                         println!("[Executing: {} {}]", req.binary, req.args.join(" "));
@@ -320,23 +320,24 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
                             remaining_commands,
                             error,
                         };
-                        current_prompt = serde_json::to_string(&result)?;
+                        current_prompt = serde_json::to_string(&result).unwrap_or_else(|_| {
+                            "{\"error\": \"Failed to serialize command result\"}".to_string()
+                        });
                     }
 
                     Err(e) => {
                         let error_result = CommandResult {
                             status: None,
-
                             stdout: String::new(),
-
                             stderr: String::new(),
-
                             remaining_commands,
-
                             error: Some(format!("Failed to parse command request: {}", e)),
                         };
 
-                        current_prompt = serde_json::to_string(&error_result)?;
+                        current_prompt =
+                            serde_json::to_string(&error_result).unwrap_or_else(|_| {
+                                "{\"error\": \"Failed to serialize parse error\"}".to_string()
+                            });
                     }
                 }
             }
@@ -472,5 +473,8 @@ mod tests {
 
         let response = "Text\n  !!!OCHA_RUN_CMD{\"a\": 1}\nEnding";
         assert_eq!(extract_command(response), Some("{\"a\": 1}"));
+
+        let response = "!!!OCHA_RUN_CMD{\"binary\": \"ls\"} some trailing text";
+        assert_eq!(extract_command(response), Some("{\"binary\": \"ls\"}"));
     }
 }
