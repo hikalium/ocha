@@ -214,6 +214,7 @@ async fn generate_internal(
     prompt: &str,
     session: &mut Session,
     stream_output: bool,
+    log_path: Option<&std::path::Path>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let request_body = GenerateRequest {
         model,
@@ -237,15 +238,46 @@ async fn generate_internal(
     let mut full_response = String::new();
     let mut is_command_mode = false;
     let mut last_line_start = 0;
+    let mut line_buffer = Vec::new();
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        let lines = std::str::from_utf8(&chunk)?;
-        for line_json in lines.lines() {
-            if line_json.trim().is_empty() {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                if let (Some(path), false) = (log_path, full_response.trim().is_empty()) {
+                    append_to_log(path, "llm", full_response.trim());
+                }
+                return Err(Box::new(e));
+            }
+        };
+
+        line_buffer.extend_from_slice(&chunk);
+
+        while let Some(newline_pos) = line_buffer.iter().position(|&b| b == b'\n') {
+            let line_bytes = line_buffer.drain(..=newline_pos).collect::<Vec<u8>>();
+            let line_str = match std::str::from_utf8(&line_bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    if let (Some(path), false) = (log_path, full_response.trim().is_empty()) {
+                        append_to_log(path, "llm", full_response.trim());
+                    }
+                    return Err(Box::new(e));
+                }
+            };
+
+            if line_str.trim().is_empty() {
                 continue;
             }
-            let resp_part: GenerateResponse = serde_json::from_str(line_json)?;
+
+            let resp_part: GenerateResponse = match serde_json::from_str(line_str) {
+                Ok(rp) => rp,
+                Err(e) => {
+                    if let (Some(path), false) = (log_path, full_response.trim().is_empty()) {
+                        append_to_log(path, "llm", full_response.trim());
+                    }
+                    return Err(Box::new(e));
+                }
+            };
 
             for c in resp_part.response.chars() {
                 full_response.push(c);
@@ -321,14 +353,13 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
             &current_prompt,
             config.session,
             true,
+            config.log_path,
         )
         .await?;
 
         // Log the LLM response before potentially executing a command
-        if let Some(path) = config.log_path {
-            if !response.trim().is_empty() {
-                append_to_log(path, "llm", response.trim());
-            }
+        if let (Some(path), false) = (config.log_path, response.trim().is_empty()) {
+            append_to_log(path, "llm", response.trim());
         }
 
         if let Some(cmd_json_str) = extract_command(&response) {
@@ -552,9 +583,15 @@ mod tests {
 
         assert_eq!(logs.len(), 2);
         assert_eq!(logs[0].entity, "user");
-        assert_eq!(logs[0].content, serde_json::Value::String("Hello".to_string()));
+        assert_eq!(
+            logs[0].content,
+            serde_json::Value::String("Hello".to_string())
+        );
         assert_eq!(logs[1].entity, "llm");
-        assert_eq!(logs[1].content, serde_json::Value::String("Hi there".to_string()));
+        assert_eq!(
+            logs[1].content,
+            serde_json::Value::String("Hi there".to_string())
+        );
         assert!(!logs[0].timestamp.is_empty());
     }
 }
