@@ -22,6 +22,8 @@ This document provides context for AI agents (like Gemini) to assist in the ongo
 - [x] Streaming Support
 - [x] Persistent Sessions
 - [x] Interactive Mode
+- [x] Probability-based Reminders
+- [x] Agentic Command Execution
 - [ ] Enhanced API Interaction (e.g., `/api/tags` to list models)
 - [ ] Multi-turn chat using `/api/chat` (currently uses `/api/generate` with context)
 - [ ] CLI Polish (colorized output, better error handling)

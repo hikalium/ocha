@@ -4,6 +4,9 @@ use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::process::Stdio;
+use tokio::io::AsyncReadExt;
+use tokio::time::{Duration, timeout};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -27,6 +30,10 @@ struct Args {
     /// Path to a reminders JSON file
     #[arg(short = 'r', long)]
     reminders: Option<PathBuf>,
+
+    /// Max number of command executions per user response
+    #[arg(long, default_value = "5")]
+    command_per_response: usize,
 
     /// The prompt to send to the model. If omitted, starts interactive mode.
     prompt: Option<String>,
@@ -65,14 +72,38 @@ struct Reminder {
     probability: f32,
     prompt: String,
     timing: Timing,
+    #[serde(default)]
+    init: bool,
 }
 
-fn apply_reminders(prompt: &str, reminders: &[Reminder]) -> String {
+#[derive(Deserialize, Debug)]
+struct CommandRequest {
+    timeout: u64,
+    binary: String,
+    args: Vec<String>,
+    #[allow(dead_code)]
+    description: String,
+}
+
+#[derive(Serialize, Debug)]
+struct CommandResult {
+    status: Option<i32>,
+    stdout: String,
+    stderr: String,
+    remaining_commands: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+fn apply_reminders(prompt: &str, reminders: &[Reminder], is_new_session: bool) -> String {
     let mut rng = rand::rng();
     let mut pre = String::new();
     let mut post = String::new();
 
     for reminder in reminders {
+        if reminder.init && !is_new_session {
+            continue;
+        }
         if rng.random_range(0.0..1.0) < reminder.probability {
             match reminder.timing {
                 Timing::Pre => pre.push_str(&reminder.prompt),
@@ -84,23 +115,61 @@ fn apply_reminders(prompt: &str, reminders: &[Reminder]) -> String {
     format!("{}{}{}", pre, prompt, post)
 }
 
-async fn generate(
+async fn execute_command(req: CommandRequest) -> (Option<i32>, String, String, Option<String>) {
+    let mut cmd = tokio::process::Command::new(&req.binary);
+    cmd.args(&req.args);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    match cmd.spawn() {
+        Ok(mut child) => match timeout(Duration::from_secs(req.timeout), child.wait()).await {
+            Ok(Ok(status)) => {
+                let mut stdout = String::new();
+                let mut stderr = String::new();
+                if let Some(mut out) = child.stdout.take() {
+                    let _ = out.read_to_string(&mut stdout).await;
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    let _ = err.read_to_string(&mut stderr).await;
+                }
+                (status.code(), stdout, stderr, None)
+            }
+            Ok(Err(e)) => (
+                None,
+                String::new(),
+                String::new(),
+                Some(format!("Execution failed: {}", e)),
+            ),
+            Err(_) => {
+                let _ = child.kill().await;
+                (
+                    None,
+                    String::new(),
+                    String::new(),
+                    Some("Execution timed out".to_string()),
+                )
+            }
+        },
+        Err(e) => (
+            None,
+            String::new(),
+            String::new(),
+            Some(format!("Failed to spawn: {}", e)),
+        ),
+    }
+}
+
+async fn generate_internal(
     client: &reqwest::Client,
     url: &str,
     model: &str,
     prompt: &str,
     session: &mut Session,
-    reminders: &[Reminder],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let final_prompt = if reminders.is_empty() {
-        prompt.to_string()
-    } else {
-        apply_reminders(prompt, reminders)
-    };
-
+    stream_output: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
     let request_body = GenerateRequest {
         model,
-        prompt: &final_prompt,
+        prompt,
         stream: true,
         context: if session.context.is_empty() {
             None
@@ -117,18 +186,29 @@ async fn generate(
     }
 
     let mut stream = res.bytes_stream();
+    let mut full_response = String::new();
+    let mut is_command_mode = false;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
-        // NDJSON: each chunk might contain one or more JSON objects separated by newlines
         let lines = std::str::from_utf8(&chunk)?;
         for line in lines.lines() {
             if line.trim().is_empty() {
                 continue;
             }
             let resp_part: GenerateResponse = serde_json::from_str(line)?;
-            print!("{}", resp_part.response);
-            io::stdout().flush()?;
+
+            full_response.push_str(&resp_part.response);
+
+            // Check for command marker only at the beginning
+            if !is_command_mode && full_response.trim_start().starts_with("!!!OCHA_RUN_CMD") {
+                is_command_mode = true;
+            }
+
+            if stream_output && !is_command_mode {
+                print!("{}", resp_part.response);
+                io::stdout().flush()?;
+            }
 
             #[allow(clippy::collapsible_if)]
             if resp_part.done {
@@ -138,7 +218,118 @@ async fn generate(
             }
         }
     }
-    println!();
+
+    if stream_output && !is_command_mode {
+        println!();
+    }
+
+    Ok(full_response)
+}
+
+struct RunTurnConfig<'a> {
+    client: &'a reqwest::Client,
+
+    url: &'a str,
+
+    model: &'a str,
+
+    initial_prompt: &'a str,
+
+    session: &'a mut Session,
+
+    reminders: &'a [Reminder],
+
+    command_per_response: usize,
+
+    is_new_session: bool,
+}
+
+async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut current_prompt = apply_reminders(
+        config.initial_prompt,
+        config.reminders,
+        config.is_new_session,
+    );
+
+    let mut remaining_commands = config.command_per_response;
+
+    loop {
+        let response = generate_internal(
+            config.client,
+            config.url,
+            config.model,
+            &current_prompt,
+            config.session,
+            true,
+        )
+        .await?;
+
+        if let Some(cmd_json_str) = response.trim().strip_prefix("!!!OCHA_RUN_CMD") {
+            if remaining_commands == 0 {
+                let error_result = CommandResult {
+                    status: None,
+
+                    stdout: String::new(),
+
+                    stderr: String::new(),
+
+                    remaining_commands: 0,
+
+                    error: Some("Command execution limit exceeded per response.".to_string()),
+                };
+
+                current_prompt = serde_json::to_string(&error_result)?;
+
+                // Continue loop to report error to model
+            } else {
+                remaining_commands -= 1;
+
+                // Parse JSON
+
+                match serde_json::from_str::<CommandRequest>(cmd_json_str) {
+                    Ok(req) => {
+                        println!("[Executing: {} {}]", req.binary, req.args.join(" "));
+
+                        let (status, stdout, stderr, error) = execute_command(req).await;
+
+                        let result = CommandResult {
+                            status,
+
+                            stdout,
+
+                            stderr,
+
+                            remaining_commands,
+
+                            error,
+                        };
+
+                        current_prompt = serde_json::to_string(&result)?;
+                    }
+
+                    Err(e) => {
+                        let error_result = CommandResult {
+                            status: None,
+
+                            stdout: String::new(),
+
+                            stderr: String::new(),
+
+                            remaining_commands,
+
+                            error: Some(format!("Failed to parse command request: {}", e)),
+                        };
+
+                        current_prompt = serde_json::to_string(&error_result)?;
+                    }
+                }
+            }
+        } else {
+            // Normal text response, we are done with this turn
+
+            break;
+        }
+    }
 
     Ok(())
 }
@@ -160,6 +351,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Session::default()
     };
 
+    // Simple check: if context is empty, it's a new session
+    let is_new_session_initial = session.context.is_empty();
+
     let reminders: Vec<Reminder> = if let Some(ref path) = args.reminders {
         let content = std::fs::read_to_string(path)?;
         serde_json::from_str(&content)?
@@ -168,14 +362,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if let Some(prompt) = args.prompt {
-        generate(
-            &client,
-            &url,
-            &args.model,
-            &prompt,
-            &mut session,
-            &reminders,
-        )
+        run_turn(RunTurnConfig {
+            client: &client,
+            url: &url,
+            model: &args.model,
+            initial_prompt: &prompt,
+            session: &mut session,
+            reminders: &reminders,
+            command_per_response: args.command_per_response,
+            is_new_session: is_new_session_initial,
+        })
         .await?;
         if let Some(ref path) = args.session {
             let content = serde_json::to_string_pretty(&session)?;
@@ -183,6 +379,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         println!("Entering interactive mode. Type 'exit' or use Ctrl+C to quit.");
+        let mut first_turn = true;
         loop {
             print!(">>> ");
             io::stdout().flush()?;
@@ -200,7 +397,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
 
-            generate(&client, &url, &args.model, input, &mut session, &reminders).await?;
+            let is_new = if first_turn {
+                is_new_session_initial
+            } else {
+                false
+            };
+
+            run_turn(RunTurnConfig {
+                client: &client,
+                url: &url,
+                model: &args.model,
+                initial_prompt: input,
+                session: &mut session,
+                reminders: &reminders,
+                command_per_response: args.command_per_response,
+                is_new_session: is_new,
+            })
+            .await?;
+
+            first_turn = false;
 
             if let Some(ref path) = args.session {
                 let content = serde_json::to_string_pretty(&session)?;

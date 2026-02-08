@@ -58,13 +58,25 @@ You can inject hidden prompts (e.g., system instructions) based on probability u
 ```json
 [
   {
-    "probability": 0.5,
+    "probability": 1.0,
     "prompt": " (Keep your response very brief)",
-    "timing": "post"
+    "timing": "post",
+    "init": false
   }
 ]
 ```
-Usage: `ocha -r reminders.json "Tell me a story."`
+The `init` field (default: `false`) determines if the reminder is only applied at the start of a new session.
+
+### Command Execution (Agentic Capabilities)
+`ocha` can execute commands on behalf of the model if enabled. The model can request execution by outputting a specific JSON structure prefixed with `!!!OCHA_RUN_CMD`.
+
+**Protocol:**
+1. Model outputs: `!!!OCHA_RUN_CMD{"binary": "ls", "args": ["-la"], "timeout": 5, "description": "Listing files"}`
+2. `ocha` executes the command and feeds the result (exit code, stdout, stderr) back to the model as a JSON payload.
+3. The model continues generation based on the command result.
+
+**Safety Limits:**
+- `--command-per-response`: Limits the number of chained commands per user turn (default: 5).
 
 ### Examples
 
