@@ -159,6 +159,17 @@ async fn execute_command(req: CommandRequest) -> (Option<i32>, String, String, O
     }
 }
 
+fn is_command_line(line: &str) -> bool {
+    line.trim_start().starts_with("!!!OCHA_RUN_CMD")
+}
+
+fn extract_command(response: &str) -> Option<&str> {
+    response
+        .lines()
+        .find(|l| is_command_line(l))
+        .map(|l| l.trim_start().strip_prefix("!!!OCHA_RUN_CMD").unwrap())
+}
+
 async fn generate_internal(
     client: &reqwest::Client,
     url: &str,
@@ -188,33 +199,39 @@ async fn generate_internal(
     let mut stream = res.bytes_stream();
     let mut full_response = String::new();
     let mut is_command_mode = false;
+    let mut last_line_start = 0;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         let lines = std::str::from_utf8(&chunk)?;
-        for line in lines.lines() {
-            if line.trim().is_empty() {
+        for line_json in lines.lines() {
+            if line_json.trim().is_empty() {
                 continue;
             }
-            let resp_part: GenerateResponse = serde_json::from_str(line)?;
+            let resp_part: GenerateResponse = serde_json::from_str(line_json)?;
 
-            full_response.push_str(&resp_part.response);
+            for c in resp_part.response.chars() {
+                full_response.push(c);
 
-            // Check for command marker only at the beginning
-            if !is_command_mode && full_response.trim_start().starts_with("!!!OCHA_RUN_CMD") {
-                is_command_mode = true;
-            }
-
-            if stream_output && !is_command_mode {
-                print!("{}", resp_part.response);
-                io::stdout().flush()?;
-            }
-
-            #[allow(clippy::collapsible_if)]
-            if resp_part.done {
-                if let Some(ctx) = resp_part.context {
-                    session.context = ctx;
+                if !is_command_mode {
+                    let current_line = &full_response[last_line_start..];
+                    if is_command_line(current_line) {
+                        is_command_mode = true;
+                    }
                 }
+
+                if stream_output && !is_command_mode {
+                    print!("{}", c);
+                    io::stdout().flush()?;
+                }
+
+                if c == '\n' {
+                    last_line_start = full_response.len();
+                }
+            }
+
+            if let (true, Some(ctx)) = (resp_part.done, resp_part.context) {
+                session.context = ctx;
             }
         }
     }
@@ -264,7 +281,7 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
         )
         .await?;
 
-        if let Some(cmd_json_str) = response.trim().strip_prefix("!!!OCHA_RUN_CMD") {
+        if let Some(cmd_json_str) = extract_command(&response) {
             if remaining_commands == 0 {
                 let error_result = CommandResult {
                     status: None,
@@ -424,4 +441,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_command_line() {
+        assert!(is_command_line("!!!OCHA_RUN_CMD{}"));
+        assert!(is_command_line("  !!!OCHA_RUN_CMD{}"));
+        assert!(is_command_line("\t!!!OCHA_RUN_CMD{}"));
+        assert!(!is_command_line("Not a command"));
+        assert!(!is_command_line("Check this: !!!OCHA_RUN_CMD{}"));
+    }
+
+    #[test]
+    fn test_extract_command() {
+        let response = "Some text\n!!!OCHA_RUN_CMD{\"binary\": \"ls\"}\nMore text";
+        assert_eq!(extract_command(response), Some("{\"binary\": \"ls\"}"));
+
+        let response = "!!!OCHA_RUN_CMD{\"binary\": \"whoami\"}";
+        assert_eq!(extract_command(response), Some("{\"binary\": \"whoami\"}"));
+
+        let response = "  !!!OCHA_RUN_CMD{\"binary\": \"pwd\"}";
+        assert_eq!(extract_command(response), Some("{\"binary\": \"pwd\"}"));
+
+        let response = "No command here";
+        assert_eq!(extract_command(response), None);
+
+        let response = "Text\n  !!!OCHA_RUN_CMD{\"a\": 1}\nEnding";
+        assert_eq!(extract_command(response), Some("{\"a\": 1}"));
+    }
 }
