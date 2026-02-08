@@ -14,26 +14,17 @@ This document provides context for AI agents (like Gemini) to assist in the ongo
 - **Default Model:** `gemma3:27b` (Adjusted to match local environment availability).
 
 ## Architecture Decisions
-- **Non-Streaming by Default:** To keep the initial implementation simple, `stream: false` is used in the API request.
-- **Direct Output:** The tool prints the final response string directly to `stdout`.
+- **Streaming by Default:** The tool now uses `stream: true` to provide a real-time "typing" experience.
+- **Persistent Sessions:** Context is managed via a `Session` struct and can be saved to a JSON file using the `--session` flag.
+- **Interactive REPL:** If no prompt is provided, the tool enters a loop reading from `stdin`.
 
 ## Roadmap & Future Tasks
-When continuing development, consider the following enhancements:
-
-### 1. Streaming Support
-- Modify `GenerateRequest` to set `stream: true`.
-- Use `reqwest` to handle the response stream.
-- Parse the NDJSON (Newline Delimited JSON) chunks and print them to `stdout` in real-time.
-
-### 2. Enhanced API Interaction
-- Implement `/api/tags` to list available models.
-- Implement `/api/chat` for multi-turn conversations (maintaining message history).
-- Add support for system prompts.
-
-### 3. CLI Polish
-- Add a `--json` flag to output the raw response.
-- Improve error messages (e.g., check if the server is up before sending the payload).
-- Add colorized output for better readability.
+- [x] Streaming Support
+- [x] Persistent Sessions
+- [x] Interactive Mode
+- [ ] Enhanced API Interaction (e.g., `/api/tags` to list models)
+- [ ] Multi-turn chat using `/api/chat` (currently uses `/api/generate` with context)
+- [ ] CLI Polish (colorized output, better error handling)
 
 ## Guidelines for Gemini
 - **Git Commits:** Always run `git commit` after completing a coherent set of changes (e.g., after adding a feature or fixing a bug).
