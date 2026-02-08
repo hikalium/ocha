@@ -89,6 +89,7 @@ async fn generate(
             io::stdout().flush()?;
             full_response.push_str(&resp_part.response);
 
+            #[allow(clippy::collapsible_if)]
             if resp_part.done {
                 if let Some(ctx) = resp_part.context {
                     session.context = ctx;

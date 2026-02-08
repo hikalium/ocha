@@ -27,7 +27,7 @@ This document provides context for AI agents (like Gemini) to assist in the ongo
 - [ ] CLI Polish (colorized output, better error handling)
 
 ## Guidelines for Gemini
-- **Git Commits:** Always run `git commit` after completing a coherent set of changes (e.g., after adding a feature or fixing a bug).
+- **Git Commits:** Always run `git commit` after completing a coherent set of changes. Before committing, ensure you run `cargo fmt` and `cargo clippy --all-targets --all-features -- -D warnings` and fix any issues.
 - **Keep it Simple:** Avoid over-engineering. `ocha` is intended to be a lightweight tool.
 - **Idiomatic Rust:** Follow standard Rust conventions. Use `Result` for error handling.
 - **Documentation:** Always update `README.md` when adding new CLI flags or features.
