@@ -39,6 +39,10 @@ struct Args {
     #[arg(long)]
     log: Option<PathBuf>,
 
+    /// List available models on the Ollama server
+    #[arg(long)]
+    list_models: bool,
+
     /// The prompt to send to the model. If omitted, starts interactive mode.
     prompt: Option<String>,
 }
@@ -70,6 +74,18 @@ fn append_to_log(path: &std::path::Path, entity: &str, content: impl Serialize) 
     if let Ok(file) = std::fs::File::create(path) {
         let _ = serde_json::to_writer_pretty(file, &logs);
     }
+}
+
+#[derive(Deserialize)]
+struct ModelInfo {
+    name: String,
+    size: u64,
+    modified_at: String,
+}
+
+#[derive(Deserialize)]
+struct ModelsResponse {
+    models: Vec<ModelInfo>,
 }
 
 #[derive(Serialize)]
@@ -146,6 +162,29 @@ fn apply_reminders(prompt: &str, reminders: &[Reminder], is_new_session: bool) -
     }
 
     format!("{}{}{}", pre, prompt, post)
+}
+
+async fn list_models(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let res = client.get(url).send().await?;
+    if !res.status().is_success() {
+        let err_text = res.text().await?;
+        return Err(format!("Ollama API error: {}", err_text).into());
+    }
+
+    let resp: ModelsResponse = res.json().await?;
+    println!("{:<40} {:<10} {:<20}", "NAME", "SIZE", "MODIFIED");
+    println!("{}", "-".repeat(70));
+    for model in resp.models {
+        let size_gb = model.size as f64 / 1_073_741_824.0;
+        println!(
+            "{:<40} {:<10.2} GB {:<20}",
+            model.name, size_gb, model.modified_at
+        );
+    }
+    Ok(())
 }
 
 async fn execute_command(req: CommandRequest) -> (Option<i32>, String, String, Option<String>) {
@@ -450,6 +489,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let url = format!("http://{}:{}/api/generate", args.server, args.port);
     let client = reqwest::Client::new();
+
+    if args.list_models {
+        let tags_url = format!("http://{}:{}/api/tags", args.server, args.port);
+        list_models(&client, &tags_url).await?;
+        return Ok(());
+    }
 
     let mut session = if let Some(ref path) = args.session {
         if path.exists() {
