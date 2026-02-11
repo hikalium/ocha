@@ -1,0 +1,20 @@
+[
+  {
+    "probability": 0.2,
+    "prompt": "\n\n# Command Execution Instructions\nTo execute a command, start a new line with exactly `!!!OCHA_RUN_CMD` followed by a JSON object.\nThe JSON must include: \"binary\" (string), \"args\" (array of strings), \"timeout\" (integer seconds), and \"description\" (string).\nExample: !!!OCHA_RUN_CMD{\"binary\": \"ls\", \"args\": [\"-F\"], \"timeout\": 5, \"description\": \"List files\"}\n\n# Strategy\n1. Use commands to explore the environment when information is missing.\n2. Execute one command at a time and wait for the output.\n3. Verify the result of a command before proceeding to the next step.\n4. If a command fails or returns an error, try an alternative approach.",
+    "timing": "post",
+    "init": true
+  },
+  {
+    "probability": 0.2,
+    "prompt": "\n\n# Tool Not Found Strategy\nIf a requested tool is not found in the environment, identify the correct package manager or method to install it. Suggest the specific command the user should run to install the tool on your behalf so you can use it in subsequent steps.",
+    "timing": "post",
+    "init": true
+  },
+  {
+    "probability": 0.2,
+    "prompt": "\n\n# Output Formatting Reminder\nNote that the raw output of commands is not automatically displayed to the user in a formatted way. If you need to share specific results, data, or logs from a command with the user, you must manually excerpt the relevant parts and include them in your text response.",
+    "timing": "post",
+    "init": true
+  }
+]
