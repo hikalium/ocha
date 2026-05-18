@@ -1,11 +1,19 @@
 # ocha
 
-A simple Rust CLI tool to interact with an Ollama server on your local network.
+A simple Rust CLI tool to talk to LLM backends behind one provider-neutral
+interface. Supported backends:
+
+- **`ollama`** (default) — a local/network Ollama server (native `/api/chat`).
+- **`claude`** — the Anthropic Messages API (`/v1/messages`).
+
+ocha owns its own agent loop, so the agentic command protocol is plain text
+and works identically on every backend regardless of native tool support.
 
 ## Prerequisites
 
 - **Rust toolchain**: Installed via [rustup](https://rustup.rs/).
-- **Ollama**: An Ollama server running and reachable on your network.
+- **Ollama** (for the `ollama` backend): a server running and reachable.
+- **`ANTHROPIC_API_KEY`** (for the `claude` backend): exported in the env.
 
 ## Installation
 
@@ -45,11 +53,31 @@ ocha -S my_chat.json "What is my name?"
 
 | Flag | Long Flag | Description | Default |
 |------|-----------|-------------|---------|
-| `-s` | `--server`| IP address of the Ollama server | `127.0.0.1` |
-| `-p` | `--port`  | Port of the Ollama server | `11434` |
-| `-m` | `--model` | Model name to use | `gemma3:27b` |
+|      | `--backend`| Backend: `ollama` or `claude` | `ollama` |
+| `-s` | `--server`| IP address of the Ollama server (ollama only) | `127.0.0.1` |
+| `-p` | `--port`  | Port of the Ollama server (ollama only) | `11434` |
+|      | `--api-base`| Override API base URL | per-backend |
+| `-m` | `--model` | Model name to use | ollama `gemma3:27b` / claude `claude-sonnet-4-6` |
+|      | `--max-tokens`| Max tokens to generate (claude only) | `4096` |
+|      | `--system`| System prompt sent out of band | (None) |
 | `-S` | `--session`| Path to session JSON file | (None) |
 | `-r` | `--reminders`| Path to reminders JSON file | (None) |
+
+> **Session format change.** Sessions are now stored as a neutral message
+> history (`{"messages":[...]}`) so they work across backends. Old
+> Ollama-only `{"context":[...]}` files are ignored and start fresh.
+
+#### Backend examples
+
+```bash
+# Ollama (default)
+ocha -m llama3 "What is Rust?"
+
+# Claude (Anthropic Messages API)
+export ANTHROPIC_API_KEY=sk-ant-...
+ocha --backend claude "Explain ownership in one sentence."
+ocha --backend claude -m claude-sonnet-4-6 --system "Be terse." "Hi"
+```
 
 ### Reminders
 You can inject hidden prompts (e.g., system instructions) based on probability using a reminders file.

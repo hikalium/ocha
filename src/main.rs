@@ -1,5 +1,4 @@
-use clap::Parser;
-use futures_util::StreamExt;
+use clap::{Parser, ValueEnum};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
@@ -8,20 +7,49 @@ use std::process::Stdio;
 use tokio::io::AsyncReadExt;
 use tokio::time::{Duration, timeout};
 
+mod backend;
+use backend::claude::ClaudeBackend;
+use backend::ollama::OllamaBackend;
+use backend::{Backend, Message, Role, Session};
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lowercase")]
+enum BackendKind {
+    Ollama,
+    Claude,
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// IP address of the Ollama server
+    /// Which LLM backend to talk to
+    #[arg(long, value_enum, default_value_t = BackendKind::Ollama)]
+    backend: BackendKind,
+
+    /// IP address of the Ollama server (ollama backend only)
     #[arg(short = 's', long, default_value = "127.0.0.1")]
     server: String,
 
-    /// Port of the Ollama server
+    /// Port of the Ollama server (ollama backend only)
     #[arg(short = 'p', long, default_value = "11434")]
     port: u16,
 
-    /// Model to use
-    #[arg(short = 'm', long, default_value = "gemma3:27b")]
-    model: String,
+    /// Override the API base URL (defaults: ollama http://<server>:<port>,
+    /// claude https://api.anthropic.com)
+    #[arg(long)]
+    api_base: Option<String>,
+
+    /// Model to use (defaults: ollama gemma3:27b, claude claude-sonnet-4-6)
+    #[arg(short = 'm', long)]
+    model: Option<String>,
+
+    /// Max tokens to generate (claude backend only)
+    #[arg(long, default_value = "4096")]
+    max_tokens: u32,
+
+    /// Optional system prompt sent out of band
+    #[arg(long)]
+    system: Option<String>,
 
     /// Path to a session file for persistent context
     #[arg(short = 'S', long)]
@@ -39,7 +67,7 @@ struct Args {
     #[arg(long)]
     log: Option<PathBuf>,
 
-    /// List available models on the Ollama server
+    /// List available models on the selected backend
     #[arg(long)]
     list_models: bool,
 
@@ -74,39 +102,6 @@ fn append_to_log(path: &std::path::Path, entity: &str, content: impl Serialize) 
     if let Ok(file) = std::fs::File::create(path) {
         let _ = serde_json::to_writer_pretty(file, &logs);
     }
-}
-
-#[derive(Deserialize)]
-struct ModelInfo {
-    name: String,
-    size: u64,
-    modified_at: String,
-}
-
-#[derive(Deserialize)]
-struct ModelsResponse {
-    models: Vec<ModelInfo>,
-}
-
-#[derive(Serialize)]
-struct GenerateRequest<'a> {
-    model: &'a str,
-    prompt: &'a str,
-    stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    context: Option<&'a [i32]>,
-}
-
-#[derive(Deserialize, Serialize, Default)]
-struct Session {
-    context: Vec<i32>,
-}
-
-#[derive(Deserialize)]
-struct GenerateResponse {
-    response: String,
-    done: bool,
-    context: Option<Vec<i32>>,
 }
 
 #[derive(Deserialize, Debug, Clone, Copy)]
@@ -144,7 +139,11 @@ struct CommandResult {
     error: Option<String>,
 }
 
-fn apply_reminders(prompt: &str, reminders: &[Reminder], is_new_session: bool) -> (String, Vec<String>) {
+fn apply_reminders(
+    prompt: &str,
+    reminders: &[Reminder],
+    is_new_session: bool,
+) -> (String, Vec<String>) {
     let mut rng = rand::rng();
     let mut pre = String::new();
     let mut post = String::new();
@@ -167,29 +166,6 @@ fn apply_reminders(prompt: &str, reminders: &[Reminder], is_new_session: bool) -
     }
 
     (format!("{}{}{}", pre, prompt, post), activated)
-}
-
-async fn list_models(
-    client: &reqwest::Client,
-    url: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let res = client.get(url).send().await?;
-    if !res.status().is_success() {
-        let err_text = res.text().await?;
-        return Err(format!("Ollama API error: {}", err_text).into());
-    }
-
-    let resp: ModelsResponse = res.json().await?;
-    println!("{:<40} {:<10} {:<20}", "NAME", "SIZE", "MODIFIED");
-    println!("{}", "-".repeat(70));
-    for model in resp.models {
-        let size_gb = model.size as f64 / 1_073_741_824.0;
-        println!(
-            "{:<40} {:<10.2} GB {:<20}",
-            model.name, size_gb, model.modified_at
-        );
-    }
-    Ok(())
 }
 
 async fn execute_command(req: CommandRequest) -> (Option<i32>, String, String, Option<String>) {
@@ -251,128 +227,14 @@ fn extract_command(response: &str) -> Option<&str> {
     })
 }
 
-async fn generate_internal(
-    client: &reqwest::Client,
-    url: &str,
-    model: &str,
-    prompt: &str,
-    session: &mut Session,
-    stream_output: bool,
-    log_path: Option<&std::path::Path>,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let request_body = GenerateRequest {
-        model,
-        prompt,
-        stream: true,
-        context: if session.context.is_empty() {
-            None
-        } else {
-            Some(&session.context)
-        },
-    };
-
-    let res = client.post(url).json(&request_body).send().await?;
-
-    if !res.status().is_success() {
-        let err_text = res.text().await?;
-        return Err(format!("Ollama API error: {}", err_text).into());
-    }
-
-    let mut stream = res.bytes_stream();
-    let mut full_response = String::new();
-    let mut is_command_mode = false;
-    let mut last_line_start = 0;
-    let mut line_buffer = Vec::new();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(c) => c,
-            Err(e) => {
-                if let (Some(path), false) = (log_path, full_response.trim().is_empty()) {
-                    append_to_log(path, "llm", full_response.trim());
-                }
-                return Err(Box::new(e));
-            }
-        };
-
-        line_buffer.extend_from_slice(&chunk);
-
-        while let Some(newline_pos) = line_buffer.iter().position(|&b| b == b'\n') {
-            let line_bytes = line_buffer.drain(..=newline_pos).collect::<Vec<u8>>();
-            let line_str = match std::str::from_utf8(&line_bytes) {
-                Ok(s) => s,
-                Err(e) => {
-                    if let (Some(path), false) = (log_path, full_response.trim().is_empty()) {
-                        append_to_log(path, "llm", full_response.trim());
-                    }
-                    return Err(Box::new(e));
-                }
-            };
-
-            if line_str.trim().is_empty() {
-                continue;
-            }
-
-            let resp_part: GenerateResponse = match serde_json::from_str(line_str) {
-                Ok(rp) => rp,
-                Err(e) => {
-                    if let (Some(path), false) = (log_path, full_response.trim().is_empty()) {
-                        append_to_log(path, "llm", full_response.trim());
-                    }
-                    return Err(Box::new(e));
-                }
-            };
-
-            for c in resp_part.response.chars() {
-                full_response.push(c);
-
-                if !is_command_mode {
-                    let current_line = &full_response[last_line_start..];
-                    if is_command_line(current_line) {
-                        is_command_mode = true;
-                    }
-                }
-
-                if stream_output {
-                    print!("{}", c);
-                    io::stdout().flush()?;
-                }
-
-                if c == '\n' {
-                    last_line_start = full_response.len();
-                }
-            }
-
-            if let (true, Some(ctx)) = (resp_part.done, resp_part.context) {
-                session.context = ctx;
-            }
-        }
-    }
-
-    if stream_output {
-        println!();
-    }
-
-    Ok(full_response)
-}
-
 struct RunTurnConfig<'a> {
-    client: &'a reqwest::Client,
-
-    url: &'a str,
-
-    model: &'a str,
-
+    backend: &'a dyn Backend,
+    system: Option<&'a str>,
     initial_prompt: &'a str,
-
     session: &'a mut Session,
-
     reminders: &'a [Reminder],
-
     command_per_response: usize,
-
     is_new_session: bool,
-
     log_path: Option<&'a std::path::Path>,
 }
 
@@ -381,135 +243,188 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
         append_to_log(path, "user", config.initial_prompt);
     }
 
-    let mut current_turn_prompt = config.initial_prompt.to_string();
+    config
+        .session
+        .messages
+        .push(Message::new(Role::User, config.initial_prompt));
+
+    let mut current_input = config.initial_prompt.to_string();
     let mut remaining_commands = config.command_per_response;
     let mut is_first_turn = config.is_new_session;
 
     loop {
-        let (prompted_input, activated_reminders) = apply_reminders(
-            &current_turn_prompt,
-            config.reminders,
-            is_first_turn,
-        );
-
+        let (prompted_input, activated_reminders) =
+            apply_reminders(&current_input, config.reminders, is_first_turn);
         is_first_turn = false;
 
         for reminder in activated_reminders {
             println!("[Reminder: {}]", reminder.trim());
         }
 
-        let response = generate_internal(
-            config.client,
-            config.url,
-            config.model,
-            &prompted_input,
-            config.session,
-            true,
-            config.log_path,
-        )
-        .await?;
+        // Reminders are ephemeral nudges: send them to the model but keep
+        // the persisted history clean by swapping only the outgoing copy
+        // of the latest turn.
+        let mut outgoing = config.session.messages.clone();
+        if let Some(last) = outgoing.last_mut() {
+            last.content = prompted_input;
+        }
 
-        // Log the LLM response before potentially executing a command
+        let mut sink = |frag: &str| {
+            print!("{}", frag);
+            let _ = io::stdout().flush();
+        };
+        let response = config
+            .backend
+            .chat(config.system, &outgoing, &mut sink)
+            .await?;
+        println!();
+
         if let (Some(path), false) = (config.log_path, response.trim().is_empty()) {
             append_to_log(path, "llm", response.trim());
         }
 
-        if let Some(cmd_json_str) = extract_command(&response) {
-            if remaining_commands == 0 {
+        config
+            .session
+            .messages
+            .push(Message::new(Role::Assistant, response.clone()));
+
+        let Some(cmd_json_str) = extract_command(&response) else {
+            break; // plain text response: turn complete
+        };
+
+        if remaining_commands == 0 {
+            let error_result = CommandResult {
+                status: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                remaining_commands: 0,
+                error: Some("Command execution limit exceeded per response.".to_string()),
+            };
+            let result_json = serde_json::to_string(&error_result)
+                .unwrap_or_else(|_| "{\"error\": \"Failed to serialize limit error\"}".to_string());
+            if let Some(path) = config.log_path {
+                append_to_log(path, "tool", &error_result);
+            }
+            config
+                .session
+                .messages
+                .push(Message::new(Role::Tool, result_json.clone()));
+            current_input = result_json;
+            continue;
+        }
+
+        remaining_commands -= 1;
+
+        let result_json = match serde_json::from_str::<CommandRequest>(cmd_json_str) {
+            Ok(req) => {
+                println!("[Payload: {}]", cmd_json_str);
+                println!("[Executing: {} {}]", req.binary, req.args.join(" "));
+                let (status, stdout, stderr, error) = execute_command(req).await;
+                if !stdout.is_empty() {
+                    println!("STDOUT:\n{}", stdout);
+                }
+                if !stderr.is_empty() {
+                    println!("STDERR:\n{}", stderr);
+                }
+                let result = CommandResult {
+                    status,
+                    stdout,
+                    stderr,
+                    remaining_commands,
+                    error,
+                };
+                let result_json = serde_json::to_string(&result).unwrap_or_else(|_| {
+                    "{\"error\": \"Failed to serialize command result\"}".to_string()
+                });
+                println!("[Result: {}]", result_json);
+                if let Some(path) = config.log_path {
+                    append_to_log(path, "tool", &result);
+                }
+                result_json
+            }
+            Err(e) => {
                 let error_result = CommandResult {
                     status: None,
                     stdout: String::new(),
                     stderr: String::new(),
-                    remaining_commands: 0,
-                    error: Some("Command execution limit exceeded per response.".to_string()),
+                    remaining_commands,
+                    error: Some(format!("Failed to parse command request: {}", e)),
                 };
-
-                current_turn_prompt = serde_json::to_string(&error_result).unwrap_or_else(|_| {
-                    "{\"error\": \"Failed to serialize limit error\"}".to_string()
-                });
-
                 if let Some(path) = config.log_path {
                     append_to_log(path, "tool", &error_result);
                 }
-                // Continue loop to report error to model
-            } else {
-                remaining_commands -= 1;
-
-                // Parse JSON
-                match serde_json::from_str::<CommandRequest>(cmd_json_str) {
-                    Ok(req) => {
-                        println!("[Payload: {}]", cmd_json_str);
-                        println!("[Executing: {} {}]", req.binary, req.args.join(" "));
-                        let (status, stdout, stderr, error) = execute_command(req).await;
-                        if !stdout.is_empty() {
-                            println!("STDOUT:\n{}", stdout);
-                        }
-                        if !stderr.is_empty() {
-                            println!("STDERR:\n{}", stderr);
-                        }
-                        let result = CommandResult {
-                            status,
-                            stdout,
-                            stderr,
-                            remaining_commands,
-                            error,
-                        };
-
-                        let result_json = serde_json::to_string(&result).unwrap_or_else(|_| {
-                            "{\"error\": \"Failed to serialize command result\"}".to_string()
-                        });
-                        println!("[Result: {}]", result_json);
-
-                        if let Some(path) = config.log_path {
-                            append_to_log(path, "tool", &result);
-                        }
-
-                        current_turn_prompt = result_json;
-                    }
-
-                    Err(e) => {
-                        let error_result = CommandResult {
-                            status: None,
-                            stdout: String::new(),
-                            stderr: String::new(),
-                            remaining_commands,
-                            error: Some(format!("Failed to parse command request: {}", e)),
-                        };
-
-                        if let Some(path) = config.log_path {
-                            append_to_log(path, "tool", &error_result);
-                        }
-
-                        current_turn_prompt =
-                            serde_json::to_string(&error_result).unwrap_or_else(|_| {
-                                "{\"error\": \"Failed to serialize parse error\"}".to_string()
-                            });
-                    }
-                }
+                serde_json::to_string(&error_result).unwrap_or_else(|_| {
+                    "{\"error\": \"Failed to serialize parse error\"}".to_string()
+                })
             }
-        } else {
-            // Normal text response, we are done with this turn
+        };
 
-            break;
-        }
+        config
+            .session
+            .messages
+            .push(Message::new(Role::Tool, result_json.clone()));
+        current_input = result_json;
     }
 
     Ok(())
 }
 
+fn build_backend(
+    args: &Args,
+    client: reqwest::Client,
+) -> Result<Box<dyn Backend>, Box<dyn std::error::Error>> {
+    match args.backend {
+        BackendKind::Ollama => {
+            let base = args
+                .api_base
+                .clone()
+                .unwrap_or_else(|| format!("http://{}:{}", args.server, args.port));
+            let model = args
+                .model
+                .clone()
+                .unwrap_or_else(|| "gemma3:27b".to_string());
+            Ok(Box::new(OllamaBackend::new(client, base, model)))
+        }
+        BackendKind::Claude => {
+            let base = args
+                .api_base
+                .clone()
+                .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+            let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(
+                |_| "ANTHROPIC_API_KEY environment variable is required for the claude backend",
+            )?;
+            let model = args
+                .model
+                .clone()
+                .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
+            Ok(Box::new(ClaudeBackend::new(
+                client,
+                base,
+                api_key,
+                model,
+                args.max_tokens,
+            )))
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let url = format!("http://{}:{}/api/generate", args.server, args.port);
     let client = reqwest::Client::new();
+    let backend = build_backend(&args, client)?;
 
     if args.list_models {
-        let tags_url = format!("http://{}:{}/api/tags", args.server, args.port);
-        list_models(&client, &tags_url).await?;
+        let models = backend.list_models().await?;
+        println!("{:<40} {:<30}", "NAME", "DETAIL");
+        println!("{}", "-".repeat(70));
+        for m in models {
+            println!("{:<40} {:<30}", m.name, m.detail);
+        }
         return Ok(());
     }
 
-    let mut session = if let Some(ref path) = args.session {
+    let mut session: Session = if let Some(ref path) = args.session {
         if path.exists() {
             let content = std::fs::read_to_string(path)?;
             serde_json::from_str(&content).unwrap_or_default()
@@ -520,8 +435,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Session::default()
     };
 
-    // Simple check: if context is empty, it's a new session
-    let is_new_session_initial = session.context.is_empty();
+    let is_new_session_initial = session.messages.is_empty();
+    let system = args.system.as_deref();
 
     let reminders: Vec<Reminder> = if let Some(ref path) = args.reminders {
         let content = std::fs::read_to_string(path)?;
@@ -530,11 +445,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Vec::new()
     };
 
-    if let Some(prompt) = args.prompt {
+    let save_session = |session: &Session| -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(ref path) = args.session {
+            std::fs::write(path, serde_json::to_string_pretty(session)?)?;
+        }
+        Ok(())
+    };
+
+    if let Some(prompt) = args.prompt.clone() {
         run_turn(RunTurnConfig {
-            client: &client,
-            url: &url,
-            model: &args.model,
+            backend: backend.as_ref(),
+            system,
             initial_prompt: &prompt,
             session: &mut session,
             reminders: &reminders,
@@ -543,10 +464,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             log_path: args.log.as_deref(),
         })
         .await?;
-        if let Some(ref path) = args.session {
-            let content = serde_json::to_string_pretty(&session)?;
-            std::fs::write(path, content)?;
-        }
+        save_session(&session)?;
     } else {
         println!("Entering interactive mode. Type 'exit' or use Ctrl+C to quit.");
         let mut first_turn = true;
@@ -574,9 +492,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             run_turn(RunTurnConfig {
-                client: &client,
-                url: &url,
-                model: &args.model,
+                backend: backend.as_ref(),
+                system,
                 initial_prompt: input,
                 session: &mut session,
                 reminders: &reminders,
@@ -587,11 +504,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
 
             first_turn = false;
-
-            if let Some(ref path) = args.session {
-                let content = serde_json::to_string_pretty(&session)?;
-                std::fs::write(path, content)?;
-            }
+            save_session(&session)?;
         }
     }
 
@@ -655,7 +568,6 @@ mod tests {
         assert!(activated.contains(&"[PRE]".to_string()));
         assert!(activated.contains(&"[POST]".to_string()));
 
-        // Test init only reminder
         let reminders_init = vec![Reminder {
             probability: 1.0,
             prompt: "[INIT]".to_string(),
@@ -670,7 +582,6 @@ mod tests {
         assert_eq!(res_no_init, "P");
         assert_eq!(act_no_init.len(), 0);
 
-        // Test init: true with 0 probability always fires on new session
         let reminders_init_zero = vec![Reminder {
             probability: 0.0,
             prompt: "[INIT_ZERO]".to_string(),

@@ -14,9 +14,20 @@ This document provides context for AI agents (like Gemini) to assist in the ongo
 - **Default Model:** `gemma3:27b` (Adjusted to match local environment availability).
 
 ## Architecture Decisions
-- **Streaming by Default:** The tool now uses `stream: true` to provide a real-time "typing" experience.
-- **Persistent Sessions:** Context is managed via a `Session` struct and can be saved to a JSON file using the `--session` flag.
-- **Interactive REPL:** If no prompt is provided, the tool enters a loop reading from `stdin`.
+- **Provider-neutral backend trait:** `src/backend/` defines a `Backend`
+  trait (`chat` + `list_models`); `ollama` and `claude` implement it.
+  `main.rs` owns the backend-agnostic turn loop, reminders, logging and
+  the agentic command protocol. Add a new provider by adding one module.
+- **Neutral conversation model:** sessions are a `Vec<Message>` of
+  role-tagged text (resent each turn — the lowest common denominator that
+  works across Ollama, Anthropic and Gemini). The Ollama-only opaque
+  `context` token array was removed.
+- **Agentic protocol stays plain text:** the `!!!OCHA_RUN_CMD` mechanism
+  is backend-independent and works even on models with no native tool
+  calling. ocha's loop is the single approval/execution point.
+- **Streaming by Default:** `stream: true`; each backend owns its own
+  framing (Ollama NDJSON vs Anthropic SSE) behind the trait.
+- **Interactive REPL:** If no prompt is provided, read from `stdin`.
 
 ## Roadmap & Future Tasks
 - [x] Streaming Support
@@ -24,9 +35,41 @@ This document provides context for AI agents (like Gemini) to assist in the ongo
 - [x] Interactive Mode
 - [x] Probability-based Reminders
 - [x] Agentic Command Execution
-- [ ] Enhanced API Interaction (e.g., `/api/tags` to list models)
-- [ ] Multi-turn chat using `/api/chat` (currently uses `/api/generate` with context)
+- [x] Enhanced API Interaction (`list-models` for every backend)
+- [x] Multi-turn chat using `/api/chat` (neutral message history)
+- [x] Provider-neutral backend trait (Ollama + Claude)
+- [ ] **Gemini backend** (see plan below)
 - [ ] CLI Polish (colorized output, better error handling)
+
+## Gemini backend — implementation plan
+
+Add `src/backend/gemini.rs` implementing `Backend`, wired in as
+`BackendKind::Gemini` (`--backend gemini`). No changes to the turn loop.
+
+1. **Endpoint:** `POST {base}/v1beta/models/{model}:streamGenerateContent?alt=sse`
+   (base default `https://generativelanguage.googleapis.com`). Auth via
+   `x-goog-api-key: $GEMINI_API_KEY` (error if unset, like the claude key).
+2. **Request mapping:** body `{ contents:[...], systemInstruction:{parts:[{text}]} }`.
+   Map roles: `Assistant -> "model"`, `User`/`Tool -> "user"`; `System`
+   turns + `--system` merged into `systemInstruction` (same split the
+   `claude` backend already does). Each message → `{role, parts:[{text}]}`.
+3. **Streaming:** with `alt=sse` Gemini emits SSE `data:` lines carrying
+   `GenerateContentResponse`; extract
+   `candidates[0].content.parts[].text`, push to the token sink, accumulate
+   full text. Reuse the line/`data:` parser shape from `claude.rs`.
+4. **Finish/usage:** read `candidates[0].finishReason`; `usageMetadata`
+   optional (kept out of the base contract).
+5. **list_models:** `GET {base}/v1beta/models` → map `name`/`displayName`
+   to `ModelInfo`. Default model e.g. `gemini-2.5-flash`.
+6. **Tools:** none declared — the text `!!!OCHA_RUN_CMD` protocol already
+   covers agentic use; declaring Gemini hosted tools would bypass ocha's
+   approval point, so they are intentionally omitted.
+7. **Tests/docs:** key-gated e2e like claude; update README options table
+   and the backend examples; `cargo fmt` + `clippy -D warnings`.
+
+Estimated surface: ~1 new file (~150 lines) + a `BackendKind` arm + a
+`build_backend` arm. The neutral loop, sessions, reminders and command
+protocol need no changes — this is the payoff of the trait refactor.
 
 ## Guidelines for Gemini
 - **Git Commits:** Always run `git commit` after completing a coherent set of changes. Before committing, ensure you run `cargo fmt` and `cargo clippy --all-targets --all-features -- -D warnings` and fix any issues.
