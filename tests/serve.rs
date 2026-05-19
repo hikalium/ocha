@@ -1,31 +1,35 @@
-//! M2 acceptance: hermetic integration test for `ocha serve`.
+//! Hermetic integration tests for `ocha serve`.
 //!
 //! Spawns the real binary with the in-process mock backend
 //! (`OCHA_MOCK_BACKEND=1`) on an OS-assigned port — no network, no real
-//! model, deterministic. Asserts the lifecycle endpoints and the
-//! loopback-only bind.
+//! model, deterministic. M2: lifecycle + loopback bind. M3: conversation
+//! over HTTP/SSE.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
-/// Start `ocha serve --port 0` (mock backend) and return the child plus
-/// the base URL it printed once bound.
+/// Start `ocha serve --port 0` (mock backend, plus any extra env) and
+/// return the child plus the base URL it printed once bound.
 #[allow(deprecated)]
 // assert_cmd::cargo::cargo_bin: fine without a custom build-dir
 // The child is returned to the caller, which kill()s + wait()s it; the
 // lint can't see across the helper boundary.
 #[allow(clippy::zombie_processes)]
-fn spawn_server() -> (Child, String) {
+fn spawn_server_env(extra: &[(&str, &str)]) -> (Child, String) {
     let bin = assert_cmd::cargo::cargo_bin("ocha");
-    let mut child = Command::new(bin)
-        .arg("serve")
+    let mut cmd = Command::new(bin);
+    cmd.arg("serve")
         .arg("--port")
         .arg("0")
         .env("OCHA_MOCK_BACKEND", "1")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn ocha serve");
+        .stderr(Stdio::piped());
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("spawn ocha serve");
 
     let stdout = child.stdout.take().unwrap();
     let mut reader = BufReader::new(stdout);
@@ -41,6 +45,29 @@ fn spawn_server() -> (Child, String) {
             return (child, line[idx..].trim().to_string());
         }
     }
+}
+
+fn spawn_server() -> (Child, String) {
+    spawn_server_env(&[])
+}
+
+/// Parse an `event:`/`data:` SSE frame into `(event, data)`.
+fn parse_frame(s: &str) -> (String, String) {
+    let mut ev = String::new();
+    let mut data = String::new();
+    for line in s.lines() {
+        if let Some(x) = line.strip_prefix("event: ") {
+            ev = x.trim().to_string();
+        }
+        if let Some(x) = line.strip_prefix("data: ") {
+            data = x.trim().to_string();
+        }
+    }
+    (ev, data)
+}
+
+fn find2(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\n\n")
 }
 
 #[test]
@@ -105,12 +132,14 @@ fn serve_lifecycle_hermetic() {
     assert!(gv["messages"].as_array().unwrap().is_empty());
     assert!(gv["pending_command"].is_null());
 
-    // Conversation is not implemented until M3.
+    // Messages to a missing session -> 404 (conversation flow itself
+    // is covered by serve_conversation_sse_hermetic).
     let pm = c
-        .post(format!("{base}/api/sessions/{id}/messages"))
+        .post(format!("{base}/api/sessions/s_doesnotexist/messages"))
+        .body(r#"{"content":"x"}"#)
         .send()
         .unwrap();
-    assert_eq!(pm.status().as_u16(), 501);
+    assert_eq!(pm.status().as_u16(), 404);
 
     // Delete -> gone.
     assert_eq!(
@@ -139,6 +168,164 @@ fn serve_lifecycle_hermetic() {
             .as_u16(),
         404
     );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// M3 acceptance: a full conversation over HTTP + SSE, hermetic.
+#[test]
+fn serve_conversation_sse_hermetic() {
+    let script = "alpha beta gamma delta";
+    let (mut child, base) = spawn_server_env(&[("OCHA_MOCK_REPLY", script)]);
+    let c = reqwest::blocking::Client::new();
+
+    let id = {
+        let v: serde_json::Value = c
+            .post(format!("{base}/api/sessions"))
+            .body("{}")
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        v["id"].as_str().unwrap().to_string()
+    };
+
+    // Subscribe to SSE in a thread; signal `ready` after the snapshot
+    // frame (subscription is then active), collect until `state:idle`
+    // following `turn_complete`.
+    let evurl = format!("{base}/api/sessions/{id}/events");
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = mpsc::channel::<Vec<(String, String)>>();
+    let t = std::thread::spawn(move || {
+        let cc = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap();
+        let mut resp = cc.get(&evurl).send().unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut tmp = [0u8; 1024];
+        let mut events: Vec<(String, String)> = Vec::new();
+        let mut ready = false;
+        let mut saw_complete = false;
+        loop {
+            let n = match resp.read(&mut tmp) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            buf.extend_from_slice(&tmp[..n]);
+            while let Some(pos) = find2(&buf) {
+                let frame: Vec<u8> = buf.drain(..pos + 2).collect();
+                let (ev, data) = parse_frame(&String::from_utf8_lossy(&frame));
+                if ev.is_empty() {
+                    continue;
+                }
+                if ev == "snapshot" && !ready {
+                    ready = true;
+                    let _ = ready_tx.send(());
+                }
+                if ev == "turn_complete" {
+                    saw_complete = true;
+                }
+                let is_idle = ev == "state" && data.contains("idle");
+                events.push((ev, data));
+                if saw_complete && is_idle {
+                    let _ = done_tx.send(events.clone());
+                    return;
+                }
+            }
+        }
+        let _ = done_tx.send(events);
+    });
+
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("SSE never connected/snapshot");
+
+    let post = c
+        .post(format!("{base}/api/sessions/{id}/messages"))
+        .body(r#"{"content":"hi"}"#)
+        .send()
+        .unwrap();
+    assert_eq!(post.status().as_u16(), 202);
+
+    let events = done_rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("turn did not complete");
+    t.join().ok();
+
+    let kinds: Vec<&str> = events.iter().map(|(e, _)| e.as_str()).collect();
+    assert_eq!(
+        kinds.first(),
+        Some(&"snapshot"),
+        "first event not snapshot: {kinds:?}"
+    );
+    let pos = |k: &str| kinds.iter().position(|x| *x == k);
+    let gen_pos = pos("state").expect("no state event");
+    let tok = pos("token").expect("no token event");
+    let msg = pos("message").expect("no message event");
+    let tc = pos("turn_complete").expect("no turn_complete");
+    assert!(
+        0 < gen_pos && gen_pos < tok,
+        "state:generating not before tokens: {kinds:?}"
+    );
+    assert!(
+        tok < msg && msg < tc,
+        "ordering token<message<turn_complete broken: {kinds:?}"
+    );
+    assert!(
+        kinds.last() == Some(&"state"),
+        "stream didn't end on state:idle: {kinds:?}"
+    );
+
+    // Assembled token text equals the mock script exactly.
+    let text: String = events
+        .iter()
+        .filter(|(e, _)| e == "token")
+        .map(|(_, d)| {
+            serde_json::from_str::<serde_json::Value>(d).unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(text, script);
+
+    // History persisted: user prompt + assistant reply.
+    let g: serde_json::Value = c
+        .get(format!("{base}/api/sessions/{id}"))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let m = g["messages"].as_array().unwrap();
+    assert_eq!(m.len(), 2);
+    assert_eq!(m[0]["role"], "user");
+    assert_eq!(m[0]["content"], "hi");
+    assert_eq!(m[1]["role"], "assistant");
+    assert_eq!(m[1]["content"], script);
+    assert_eq!(g["state"], "idle");
+
+    // Reconnect mid-idle: the snapshot carries the full history.
+    let mut r2 = c
+        .get(format!("{base}/api/sessions/{id}/events"))
+        .send()
+        .unwrap();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut tmp = [0u8; 1024];
+    let snap = loop {
+        let n = r2.read(&mut tmp).unwrap();
+        assert!(n > 0, "no snapshot on reconnect");
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = find2(&buf) {
+            break parse_frame(&String::from_utf8_lossy(&buf[..pos + 2]));
+        }
+    };
+    assert_eq!(snap.0, "snapshot");
+    let sv: serde_json::Value = serde_json::from_str(&snap.1).unwrap();
+    assert_eq!(sv["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(sv["state"], "idle");
+    drop(r2);
 
     let _ = child.kill();
     let _ = child.wait();
