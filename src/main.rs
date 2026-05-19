@@ -8,10 +8,12 @@ use tokio::io::AsyncReadExt;
 use tokio::time::{Duration, timeout};
 
 mod backend;
+mod turn;
 use backend::claude::ClaudeBackend;
 use backend::claude_cli::ClaudeCliBackend;
 use backend::ollama::OllamaBackend;
 use backend::{Backend, Message, Role, Session};
+use turn::{AutoApprover, CommandApprover, Decision, StdoutObserver, TurnObserver};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 #[clap(rename_all = "kebab-case")]
@@ -240,6 +242,8 @@ struct RunTurnConfig<'a> {
     command_per_response: usize,
     is_new_session: bool,
     log_path: Option<&'a std::path::Path>,
+    observer: &'a dyn TurnObserver,
+    approver: &'a dyn CommandApprover,
 }
 
 async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::Error>> {
@@ -262,7 +266,7 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
         is_first_turn = false;
 
         for reminder in activated_reminders {
-            println!("[Reminder: {}]", reminder.trim());
+            config.observer.reminder(reminder.trim());
         }
 
         // Reminders are ephemeral nudges: send them to the model but keep
@@ -273,15 +277,12 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
             last.content = prompted_input;
         }
 
-        let mut sink = |frag: &str| {
-            print!("{}", frag);
-            let _ = io::stdout().flush();
-        };
+        let mut sink = |frag: &str| config.observer.token(frag);
         let response = config
             .backend
             .chat(config.system, &outgoing, &mut sink)
             .await?;
-        println!();
+        config.observer.response_end();
 
         if let (Some(path), false) = (config.log_path, response.trim().is_empty()) {
             append_to_log(path, "llm", response.trim());
@@ -320,32 +321,52 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
         remaining_commands -= 1;
 
         let result_json = match serde_json::from_str::<CommandRequest>(cmd_json_str) {
-            Ok(req) => {
-                println!("[Payload: {}]", cmd_json_str);
-                println!("[Executing: {} {}]", req.binary, req.args.join(" "));
-                let (status, stdout, stderr, error) = execute_command(req).await;
-                if !stdout.is_empty() {
-                    println!("STDOUT:\n{}", stdout);
+            Ok(req) => match config.approver.decide(&req).await {
+                Decision::Approve => {
+                    config.observer.command_payload(cmd_json_str);
+                    config.observer.command_executing(&req.binary, &req.args);
+                    let (status, stdout, stderr, error) = execute_command(req).await;
+                    if !stdout.is_empty() {
+                        config.observer.command_stdout(&stdout);
+                    }
+                    if !stderr.is_empty() {
+                        config.observer.command_stderr(&stderr);
+                    }
+                    let result = CommandResult {
+                        status,
+                        stdout,
+                        stderr,
+                        remaining_commands,
+                        error,
+                    };
+                    let result_json = serde_json::to_string(&result).unwrap_or_else(|_| {
+                        "{\"error\": \"Failed to serialize command result\"}".to_string()
+                    });
+                    config.observer.command_result(&result_json);
+                    if let Some(path) = config.log_path {
+                        append_to_log(path, "tool", &result);
+                    }
+                    result_json
                 }
-                if !stderr.is_empty() {
-                    println!("STDERR:\n{}", stderr);
+                // Dormant for the CLI (AutoApprover never denies); the
+                // remote serve gate uses this path. Denied commands are
+                // fed back to the model exactly like other tool errors.
+                Decision::Deny { reason } => {
+                    let denied = CommandResult {
+                        status: None,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        remaining_commands,
+                        error: Some(format!("Command denied by operator: {}", reason)),
+                    };
+                    if let Some(path) = config.log_path {
+                        append_to_log(path, "tool", &denied);
+                    }
+                    serde_json::to_string(&denied).unwrap_or_else(|_| {
+                        "{\"error\": \"Failed to serialize deny result\"}".to_string()
+                    })
                 }
-                let result = CommandResult {
-                    status,
-                    stdout,
-                    stderr,
-                    remaining_commands,
-                    error,
-                };
-                let result_json = serde_json::to_string(&result).unwrap_or_else(|_| {
-                    "{\"error\": \"Failed to serialize command result\"}".to_string()
-                });
-                println!("[Result: {}]", result_json);
-                if let Some(path) = config.log_path {
-                    append_to_log(path, "tool", &result);
-                }
-                result_json
-            }
+            },
             Err(e) => {
                 let error_result = CommandResult {
                     status: None,
@@ -462,6 +483,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     };
 
+    // CLI seam policies: stdout output, auto-approve every command
+    // (unchanged historical behavior). `serve` will swap these.
+    let observer = StdoutObserver;
+    let approver = AutoApprover;
+
     if let Some(prompt) = args.prompt.clone() {
         run_turn(RunTurnConfig {
             backend: backend.as_ref(),
@@ -472,6 +498,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             command_per_response: args.command_per_response,
             is_new_session: is_new_session_initial,
             log_path: args.log.as_deref(),
+            observer: &observer,
+            approver: &approver,
         })
         .await?;
         save_session(&session)?;
@@ -510,6 +538,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 command_per_response: args.command_per_response,
                 is_new_session: is_new,
                 log_path: args.log.as_deref(),
+                observer: &observer,
+                approver: &approver,
             })
             .await?;
 
