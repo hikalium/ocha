@@ -1,29 +1,63 @@
 //! `ocha serve` — local HTTP server for remote conversation control.
 //!
-//! **M2 scope: lifecycle bookkeeping only.** Health, model listing,
-//! session CRUD. No turn execution, no SSE, no approval gate yet
-//! (`POST …/messages` returns `501`); those are M3/M4. The server is a
-//! client of ocha's owned loop, never a replacement for it.
+//! **M3 scope:** lifecycle (M2) **+ conversation over HTTP/SSE**. A
+//! `POST …/messages` drives ocha's own `run_turn` in a background task
+//! with an [`SseObserver`]; clients watch progress on
+//! `GET …/events` (Server-Sent Events). Approval is still
+//! [`AutoApprover`] — commands auto-execute exactly like the CLI; the
+//! remote approve/deny gate is M4. The server is a *client* of ocha's
+//! owned loop, never a replacement for it.
 //!
-//! Binds `127.0.0.1` only (design decision: localhost-only, no auth).
-//! Built on `hyper`/`hyper-util` (already in the dep graph) — no
-//! framework, per the §1.1 minimal-dependency policy.
+//! Binds `127.0.0.1` only (localhost-only, no auth). Built on
+//! `hyper`/`hyper-util` + a hand-rolled SSE stream (`futures_util`),
+//! per the §1.1 minimal-dependency policy — no framework.
 
-use crate::{BackendConfig, Reminder, build_backend};
+use crate::turn::{AutoApprover, TurnObserver};
+use crate::{BackendConfig, Reminder, Role, RunTurnConfig, Session, build_backend, run_turn};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::broadcast;
+
+/// Unified response body: JSON replies and the SSE stream both box into
+/// this so one handler signature serves both.
+type Body = BoxBody<Bytes, Infallible>;
+
+/// One Server-Sent Event. `broadcast` requires `Clone`.
+#[derive(Clone)]
+struct SseMsg {
+    event: &'static str,
+    data: serde_json::Value,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SessionState {
+    Idle,
+    Generating,
+}
+
+impl SessionState {
+    fn as_str(self) -> &'static str {
+        match self {
+            SessionState::Idle => "idle",
+            SessionState::Generating => "generating",
+        }
+    }
+}
 
 /// CLI-derived defaults for new sessions (decision: top-level args =
 /// session defaults; `POST /api/sessions` overrides per session).
@@ -31,12 +65,11 @@ pub struct ServeDefaults {
     pub backend_cfg: BackendConfig,
     pub system: Option<String>,
     pub command_per_response: usize,
-    #[allow(dead_code)] // applied to turns in M3
     pub reminders: Vec<Reminder>,
 }
 
-/// Per-session config we echo back. A superset is in design §3.1; M2
-/// keeps the minimal representative subset.
+/// Per-session config we echo back. A superset is in design §3.1; the
+/// minimal representative subset is kept.
 #[derive(Clone, Serialize)]
 struct SessionConfigOut {
     backend: String,
@@ -46,14 +79,18 @@ struct SessionConfigOut {
     approval_mode: String,
 }
 
-#[derive(Serialize)]
 struct SessionRecord {
     id: String,
-    state: &'static str,
     created_at: String,
     config: SessionConfigOut,
-    // Empty until M3 (no turns run yet).
     messages: Vec<crate::Message>,
+    state: SessionState,
+    /// Live event fan-out: every connected SSE client subscribes here.
+    tx: broadcast::Sender<SseMsg>,
+    // Materials to run a turn (resolved from defaults + create request).
+    backend_cfg: BackendConfig,
+    system: Option<String>,
+    command_per_response: usize,
 }
 
 #[derive(Deserialize, Default)]
@@ -65,33 +102,86 @@ struct CreateSessionReq {
     approval_mode: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct SendMessageReq {
+    content: String,
+}
+
 struct AppState {
     sessions: Mutex<HashMap<String, SessionRecord>>,
     next_id: AtomicU64,
     defaults: ServeDefaults,
 }
 
-fn json(status: StatusCode, body: &serde_json::Value) -> Response<Full<Bytes>> {
+/// `TurnObserver` that fans each callback out as an SSE event. Sends are
+/// best-effort: `broadcast::Sender::send` erroring just means no client
+/// is currently connected, which is fine.
+struct SseObserver {
+    tx: broadcast::Sender<SseMsg>,
+}
+
+impl SseObserver {
+    fn emit(&self, event: &'static str, data: serde_json::Value) {
+        let _ = self.tx.send(SseMsg { event, data });
+    }
+}
+
+impl TurnObserver for SseObserver {
+    fn token(&self, frag: &str) {
+        self.emit("token", serde_json::json!({ "text": frag }));
+    }
+    fn reminder(&self, text: &str) {
+        self.emit("reminder", serde_json::json!({ "text": text }));
+    }
+    fn response_end(&self) {
+        // The assistant `message` + `turn_complete` are emitted by the
+        // orchestrator once the loop returns.
+    }
+    fn command_payload(&self, _json: &str) {}
+    fn command_executing(&self, binary: &str, args: &[String]) {
+        // M3 auto-executes (no gate yet); surface what is running.
+        self.emit(
+            "command_executing",
+            serde_json::json!({ "binary": binary, "args": args }),
+        );
+    }
+    fn command_stdout(&self, _s: &str) {}
+    fn command_stderr(&self, _s: &str) {}
+    fn command_result(&self, json: &str) {
+        let data = serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
+        self.emit("command_result", data);
+    }
+}
+
+fn json(status: StatusCode, body: &serde_json::Value) -> Response<Body> {
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body.to_string())))
+        .body(Full::new(Bytes::from(body.to_string())).boxed())
         .unwrap()
 }
 
-fn err(status: StatusCode, msg: &str) -> Response<Full<Bytes>> {
+fn err(status: StatusCode, msg: &str) -> Response<Body> {
     json(status, &serde_json::json!({ "error": msg }))
 }
 
 fn snapshot(r: &SessionRecord) -> serde_json::Value {
     serde_json::json!({
         "id": r.id,
-        "state": r.state,
+        "state": r.state.as_str(),
         "created_at": r.created_at,
         "config": r.config,
         "messages": r.messages,
         "pending_command": serde_json::Value::Null,
     })
+}
+
+fn backend_name(k: crate::BackendKind) -> &'static str {
+    match k {
+        crate::BackendKind::Ollama => "ollama",
+        crate::BackendKind::Claude => "claude",
+        crate::BackendKind::ClaudeCli => "claude-cli",
+    }
 }
 
 /// Resolve a requested backend name to a concrete `BackendConfig`,
@@ -110,7 +200,151 @@ fn resolve_backend(state: &AppState, name: Option<&str>) -> BackendConfig {
     cfg
 }
 
-async fn handle(req: Request<Incoming>, state: Arc<AppState>) -> Response<Full<Bytes>> {
+/// Run one turn in a detached task, streaming progress over SSE. ocha's
+/// `run_turn` stays the single owned loop; this only feeds it.
+fn spawn_turn(state: Arc<AppState>, id: String, content: String) {
+    tokio::spawn(async move {
+        // Snapshot the per-session run materials under the lock.
+        let (backend_cfg, system, cpr, tx, history) = {
+            let map = state.sessions.lock().unwrap();
+            let Some(r) = map.get(&id) else { return };
+            (
+                r.backend_cfg.clone(),
+                r.system.clone(),
+                r.command_per_response,
+                r.tx.clone(),
+                r.messages.clone(),
+            )
+        };
+        let is_new = history.is_empty();
+        let prev_len = history.len();
+
+        let backend = match build_backend(&backend_cfg, reqwest::Client::new()) {
+            Ok(b) => b,
+            Err(e) => {
+                set_idle(&state, &id);
+                let _ = tx.send(SseMsg {
+                    event: "error",
+                    data: serde_json::json!({ "message": e.to_string() }),
+                });
+                let _ = tx.send(state_msg("idle"));
+                return;
+            }
+        };
+
+        let mut session = Session { messages: history };
+        let observer = SseObserver { tx: tx.clone() };
+        let approver = AutoApprover;
+        let cfg = RunTurnConfig {
+            backend: &*backend,
+            system: system.as_deref(),
+            initial_prompt: &content,
+            session: &mut session,
+            reminders: &state.defaults.reminders,
+            command_per_response: cpr,
+            is_new_session: is_new,
+            log_path: None,
+            observer: &observer,
+            approver: &approver,
+        };
+
+        let result = run_turn(cfg).await;
+        let final_msgs = session.messages;
+
+        {
+            let mut map = state.sessions.lock().unwrap();
+            if let Some(r) = map.get_mut(&id) {
+                r.messages = final_msgs.clone();
+                r.state = SessionState::Idle;
+            }
+        }
+
+        match result {
+            Ok(()) => {
+                for m in final_msgs.iter().skip(prev_len) {
+                    if m.role != Role::User {
+                        let _ = tx.send(SseMsg {
+                            event: "message",
+                            data: serde_json::to_value(m).unwrap_or(serde_json::Value::Null),
+                        });
+                    }
+                }
+                let _ = tx.send(SseMsg {
+                    event: "turn_complete",
+                    data: serde_json::json!({}),
+                });
+            }
+            Err(e) => {
+                let _ = tx.send(SseMsg {
+                    event: "error",
+                    data: serde_json::json!({ "message": e.to_string() }),
+                });
+            }
+        }
+        let _ = tx.send(state_msg("idle"));
+    });
+}
+
+fn state_msg(s: &'static str) -> SseMsg {
+    SseMsg {
+        event: "state",
+        data: serde_json::json!({ "state": s }),
+    }
+}
+
+fn set_idle(state: &AppState, id: &str) {
+    if let Some(r) = state.sessions.lock().unwrap().get_mut(id) {
+        r.state = SessionState::Idle;
+    }
+}
+
+fn sse_frame(msg: &SseMsg) -> Bytes {
+    Bytes::from(format!("event: {}\ndata: {}\n\n", msg.event, msg.data))
+}
+
+/// Build the `text/event-stream` body: a synthetic `snapshot` frame
+/// first, then live broadcast events, with a ~15s `ping` keep-alive.
+/// Hand-rolled via `futures_util::stream::unfold` — no extra deps.
+fn sse_response(
+    snapshot_json: serde_json::Value,
+    rx: broadcast::Receiver<SseMsg>,
+) -> Response<Body> {
+    let first = format!("event: snapshot\ndata: {snapshot_json}\n\n");
+    let stream = futures_util::stream::unfold((Some(first), rx), |(pending, mut rx)| async move {
+        if let Some(s) = pending {
+            let f: Result<Frame<Bytes>, Infallible> = Ok(Frame::data(Bytes::from(s)));
+            return Some((f, (None, rx)));
+        }
+        loop {
+            tokio::select! {
+                r = rx.recv() => match r {
+                    Ok(msg) => {
+                        let f = Ok(Frame::data(sse_frame(&msg)));
+                        return Some((f, (None, rx)));
+                    }
+                    // Slow consumer dropped events: keep the stream
+                    // alive (snapshot already reconciled state).
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                },
+                _ = tokio::time::sleep(Duration::from_secs(15)) => {
+                    let f = Ok(Frame::data(Bytes::from(
+                        "event: ping\ndata: {}\n\n".to_string(),
+                    )));
+                    return Some((f, (None, rx)));
+                }
+            }
+        }
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(StreamBody::new(stream).boxed())
+        .unwrap()
+}
+
+async fn handle(req: Request<Incoming>, state: Arc<AppState>) -> Response<Body> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
@@ -156,27 +390,29 @@ async fn handle(req: Request<Incoming>, state: Arc<AppState>) -> Response<Full<B
                 },
                 Err(e) => return err(StatusCode::BAD_REQUEST, &e.to_string()),
             };
+            let mut cfg = resolve_backend(&state, req.backend.as_deref());
+            cfg.model = req.model.clone().or(cfg.model);
             let d = &state.defaults;
             let config = SessionConfigOut {
-                backend: req.backend.unwrap_or_else(|| match d.backend_cfg.backend {
-                    crate::BackendKind::Ollama => "ollama".into(),
-                    crate::BackendKind::Claude => "claude".into(),
-                    crate::BackendKind::ClaudeCli => "claude-cli".into(),
-                }),
-                model: req.model.or_else(|| d.backend_cfg.model.clone()),
-                system: req.system.or_else(|| d.system.clone()),
+                backend: backend_name(cfg.backend).to_string(),
+                model: cfg.model.clone(),
+                system: req.system.clone().or_else(|| d.system.clone()),
                 command_per_response: req.command_per_response.unwrap_or(d.command_per_response),
-                // Serve default is the remote gate (design §1).
                 approval_mode: req.approval_mode.unwrap_or_else(|| "gated".into()),
             };
             let n = state.next_id.fetch_add(1, Ordering::SeqCst);
             let id = format!("s_{n:x}");
+            let (tx, _) = broadcast::channel(1024);
             let record = SessionRecord {
                 id: id.clone(),
-                state: "idle",
                 created_at: chrono::Local::now().to_rfc3339(),
-                config,
                 messages: Vec::new(),
+                state: SessionState::Idle,
+                tx,
+                backend_cfg: cfg,
+                system: config.system.clone(),
+                command_per_response: config.command_per_response,
+                config,
             };
             let resp = serde_json::json!({
                 "id": id, "state": "idle", "created_at": record.created_at,
@@ -191,7 +427,7 @@ async fn handle(req: Request<Incoming>, state: Arc<AppState>) -> Response<Full<B
                 .values()
                 .map(|r| {
                     serde_json::json!({
-                        "id": r.id, "state": r.state,
+                        "id": r.id, "state": r.state.as_str(),
                         "messages": r.messages.len(), "config": r.config,
                     })
                 })
@@ -216,13 +452,45 @@ async fn handle(req: Request<Incoming>, state: Arc<AppState>) -> Response<Full<B
             }
         }
 
-        (&Method::POST, ["api", "sessions", id, "messages"]) => {
-            if !state.sessions.lock().unwrap().contains_key(*id) {
-                return err(StatusCode::NOT_FOUND, "no such session");
+        (&Method::GET, ["api", "sessions", id, "events"]) => {
+            let map = state.sessions.lock().unwrap();
+            match map.get(*id) {
+                Some(r) => {
+                    let rx = r.tx.subscribe();
+                    let snap = snapshot(r);
+                    drop(map);
+                    sse_response(snap, rx)
+                }
+                None => err(StatusCode::NOT_FOUND, "no such session"),
             }
-            err(
-                StatusCode::NOT_IMPLEMENTED,
-                "conversation not implemented until M3",
+        }
+
+        (&Method::POST, ["api", "sessions", id, "messages"]) => {
+            let body = req.into_body().collect().await.map(|b| b.to_bytes());
+            let msg: SendMessageReq = match body {
+                Ok(b) => match serde_json::from_slice(&b) {
+                    Ok(v) => v,
+                    Err(e) => return err(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
+                },
+                Err(e) => return err(StatusCode::BAD_REQUEST, &e.to_string()),
+            };
+
+            let id = id.to_string();
+            {
+                let mut map = state.sessions.lock().unwrap();
+                let Some(r) = map.get_mut(&id) else {
+                    return err(StatusCode::NOT_FOUND, "no such session");
+                };
+                if r.state != SessionState::Idle {
+                    return err(StatusCode::CONFLICT, "a turn is already in progress");
+                }
+                r.state = SessionState::Generating;
+                let _ = r.tx.send(state_msg("generating"));
+            }
+            spawn_turn(state.clone(), id, msg.content);
+            json(
+                StatusCode::ACCEPTED,
+                &serde_json::json!({ "state": "generating" }),
             )
         }
 
@@ -250,7 +518,7 @@ pub async fn run(defaults: ServeDefaults, port: u16) -> Result<(), Box<dyn std::
         tokio::spawn(async move {
             let svc = service_fn(move |req| {
                 let state = state.clone();
-                async move { Ok::<_, std::convert::Infallible>(handle(req, state).await) }
+                async move { Ok::<_, Infallible>(handle(req, state).await) }
             });
             if let Err(e) = auto::Builder::new(TokioExecutor::new())
                 .serve_connection(io, svc)
