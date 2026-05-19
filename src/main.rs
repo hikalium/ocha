@@ -143,12 +143,11 @@ struct Reminder {
     init: bool,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 struct CommandRequest {
     timeout: u64,
     binary: String,
     args: Vec<String>,
-    #[allow(dead_code)]
     description: String,
 }
 
