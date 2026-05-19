@@ -211,3 +211,50 @@ impl Backend for ClaudeBackend {
             .collect())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(role: Role, content: &str) -> Message {
+        Message::new(role, content)
+    }
+
+    #[test]
+    fn no_system_yields_none() {
+        let (system, wire) = split_system_and_messages(None, &[msg(Role::User, "hi")]);
+        assert_eq!(system, None);
+        assert_eq!(wire.len(), 1);
+        assert_eq!(wire[0].role, "user");
+        assert_eq!(wire[0].content, "hi");
+    }
+
+    #[test]
+    fn out_of_band_system_and_system_turns_merge_blank_line_joined() {
+        let history = [
+            msg(Role::System, "in-history sys"),
+            msg(Role::User, "q"),
+        ];
+        let (system, wire) = split_system_and_messages(Some("oob sys"), &history);
+        // out-of-band first, then in-history System turns, joined by "\n\n".
+        assert_eq!(system.as_deref(), Some("oob sys\n\nin-history sys"));
+        // System turns are removed from the wire message list.
+        assert_eq!(wire.len(), 1);
+        assert_eq!(wire[0].role, "user");
+    }
+
+    #[test]
+    fn tool_role_collapses_to_user_assistant_preserved() {
+        let history = [
+            msg(Role::Assistant, "a"),
+            msg(Role::Tool, "tool result"),
+            msg(Role::User, "u"),
+        ];
+        let (system, wire) = split_system_and_messages(None, &history);
+        assert_eq!(system, None);
+        let roles: Vec<&str> = wire.iter().map(|w| w.role).collect();
+        // Assistant stays distinct; Tool is just another user turn.
+        assert_eq!(roles, ["assistant", "user", "user"]);
+        assert_eq!(wire[1].content, "tool result");
+    }
+}
