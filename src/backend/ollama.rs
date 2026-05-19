@@ -148,3 +148,18 @@ impl Backend for OllamaBackend {
             .collect())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_role_collapses_tool_to_user_keeps_others() {
+        // The agentic protocol is plain text, so a Tool result is just
+        // another user turn — every backend must collapse it consistently.
+        assert_eq!(wire_role(Role::System), "system");
+        assert_eq!(wire_role(Role::User), "user");
+        assert_eq!(wire_role(Role::Assistant), "assistant");
+        assert_eq!(wire_role(Role::Tool), "user");
+    }
+}
