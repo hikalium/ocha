@@ -615,4 +615,105 @@ green; `clippy -D warnings`; docs present. Tag/announce v1.
 > **Per-milestone definition of done:** acceptance check passes in CI/
 > local, `cargo fmt --check` + `cargo clippy --all-targets -- -D
 > warnings` clean, full `OCHA_TEST_OLLAMA_HOST=eevee cargo test` green,
-> CLI behavior unchanged, no unapproved dependency added.
+> CLI behavior unchanged, **dependency audit (§12) passes**.
+
+---
+
+## 12. Approved dependency baseline & per-milestone audit gate
+
+This section is the **predefined, reviewed dependency allow-list** for
+the whole serve effort. It operationalizes §1.1.
+
+### 12.1 What the plan adds
+
+**Zero new crates enter `Cargo.lock`.** The HTTP/SSE server is built on
+crates **already in the dependency graph** (pulled transitively today by
+`reqwest`). The only change to `Cargo.toml` is **promoting a few
+already-present crates to *direct* dependencies and enabling their
+`server` feature** — additional compiled code paths in
+*already-vetted, already-locked* crates, not new supply-chain surface.
+
+Caveat made explicit (this is *why* approval is needed): today `hyper
+v1.8.1` / `hyper-util v0.1.20` are compiled with **client features only**
+(`client, http1, http2`) — **no `server`**. Serve must enable it.
+
+### 12.2 Pre-approved direct-dependency changes (this is the allow-list)
+
+| Crate | In lock today | Change | Why |
+|---|---|---|---|
+| `hyper` | ✅ 1.8.1 | add as direct dep, `features=["server","http1"]` | HTTP/1.1 server |
+| `hyper-util` | ✅ 0.1.20 | add as direct dep, `features=["server","server-auto","tokio","service"]` | serve connection/IO glue |
+| `http-body-util` | ✅ 0.1.3 | add as direct dep | request/response bodies |
+| `http` | ✅ 1.4.0 | direct dep *only if* not re-exported sufficiently by `hyper` | status/headers types |
+| `bytes` | ✅ 1.11.1 | direct dep *only if* needed for body buffering | byte buffers |
+| `tokio` | ✅ 1.49.0 (direct, `full`) | **no change** | `net`, `sync::{oneshot,broadcast}`, `io` already enabled by `full` |
+| `serde`, `serde_json`, `async-trait`, `clap`, `futures-util` | ✅ direct | **no change** | JSON, trait, `serve` subcommand, streams |
+
+**Tests:** the serve integration tests use `reqwest` (already a normal
+dep) as the HTTP client and the in-crate **mock backend** (no crate).
+**No new dev-dependency** beyond the existing `assert_cmd` + `tempfile`.
+
+Anything **not** in this table — a new crate in `Cargo.lock`, a
+different crate for the HTTP/JSON/async layer (`axum`, `warp`,
+`hyper`-alternatives), a new dev-dep, or a feature enablement on a crate
+not listed here — is **out of scope and requires STOP + explicit user
+confirmation** before it is added. "It's small" / "it's only transitive"
+is not an exemption (§1.1).
+
+### 12.3 Per-milestone audit procedure (mandatory gate)
+
+Run at the end of **every** milestone M1–M5, before its commit/push:
+
+```sh
+# 1. No unexpected lock changes vs the reviewed baseline:
+git diff --stat -- Cargo.lock Cargo.toml
+cargo tree -e normal --prefix none | awk '{print $1,$2}' | sort -u \
+  > /tmp/deps.now
+diff <(cat docs/dep-baseline.txt) /tmp/deps.now    # Appendix A snapshot
+# 2. Any added crate / feature must appear in §12.2. If the diff shows
+#    anything else  ->  STOP, do not commit, ask the user.
+```
+
+A milestone **fails its definition of done** if the audit shows any
+crate or feature change not pre-approved in §12.2. The reviewed baseline
+snapshot lives in **Appendix A** (and a machine-checkable copy at
+`docs/dep-baseline.txt`, added in M1).
+
+---
+
+## Appendix A — reviewed transitive baseline (audit reference)
+
+Captured 2026-05-20. **129** normal transitive crates + **2** dev-only
+(`assert_cmd`, `tempfile`). This is the reviewed pre-image; the §12.3
+audit diffs against it every milestone. (Versions omitted here for
+readability; the exact pinned snapshot is `docs/dep-baseline.txt`,
+regenerated only with explicit approval.)
+
+```
+anstream anstyle anstyle-parse anstyle-query async-trait atomic-waker
+aws-lc-rs aws-lc-sys base64 bitflags bytes cfg-if chacha20 chrono
+clap clap_builder clap_derive clap_lex colorchoice cpufeatures
+displaydoc encoding_rs equivalent errno fnv form_urlencoded
+futures-channel futures-core futures-io futures-macro futures-sink
+futures-task futures-util getrandom h2 hashbrown heck http http-body
+http-body-util httparse hyper hyper-rustls hyper-util iana-time-zone
+icu_collections icu_locale_core icu_normalizer icu_normalizer_data
+icu_properties icu_properties_data icu_provider idna idna_adapter
+indexmap ipnet iri-string is_terminal_polyfill itoa libc litemap
+lock_api log memchr mime mio num-traits once_cell openssl-probe
+parking_lot parking_lot_core percent-encoding pin-project-lite
+pin-utils potential_utf proc-macro2 quote rand rand_core reqwest
+rustls rustls-native-certs rustls-pki-types rustls-platform-verifier
+rustls-webpki scopeguard serde serde_core serde_derive serde_json
+signal-hook-registry slab smallvec socket2 stable_deref_trait strsim
+subtle sync_wrapper syn synstructure tinystr tokio tokio-macros
+tokio-rustls tokio-util tower tower-http tower-layer tower-service
+tracing tracing-core try-lock unicode-ident untrusted url utf8_iter
+utf8parse want writeable yoke yoke-derive zerofrom zerofrom-derive
+zeroize zerovec zerovec-derive zerotrie zmij
+```
+
+> Note: `tower*`, `axum`, `warp` etc. are **not** used by the plan even
+> though some `tower*` crates appear above (they arrive via `reqwest`);
+> the server uses `hyper`/`hyper-util` directly. Their presence in the
+> baseline does **not** authorize adding them as direct deps.
