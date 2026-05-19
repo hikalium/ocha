@@ -231,10 +231,7 @@ mod tests {
 
     #[test]
     fn out_of_band_system_and_system_turns_merge_blank_line_joined() {
-        let history = [
-            msg(Role::System, "in-history sys"),
-            msg(Role::User, "q"),
-        ];
+        let history = [msg(Role::System, "in-history sys"), msg(Role::User, "q")];
         let (system, wire) = split_system_and_messages(Some("oob sys"), &history);
         // out-of-band first, then in-history System turns, joined by "\n\n".
         assert_eq!(system.as_deref(), Some("oob sys\n\nin-history sys"));
