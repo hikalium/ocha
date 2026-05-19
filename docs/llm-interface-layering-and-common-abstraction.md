@@ -166,15 +166,22 @@ The `claude-cli` backend talks to the locally installed Claude Code CLI
 this note argues *against*. It exists for exactly one payoff: the CLI is
 already authenticated (OAuth / subscription), so the backend needs no
 `ANTHROPIC_API_KEY` and no billing setup. The contradiction is contained
-by demoting the upper layer to a dumb text-completion engine:
+by stripping the upper layer back down to a tool-less model that ocha
+drives with its own plain-text loop — exactly the Ollama shape:
 
-- **Tools disabled** (`--allowed-tools ""`) — Claude Code's own agent
-  loop cannot execute anything, so it cannot bypass ocha's gate. This is
-  the §4 "hosted/self-executing tools must never be declared" rule
-  applied to a CLI instead of an API.
-- **`--system-prompt` always set** (even empty) so the large default
-  agent system prompt is replaced — the model behaves as a completion
-  endpoint, not an agent.
+- **Built-in tools removed** (`--tools ""`, *not* `--allowed-tools ""`)
+  — this drops the tools from the declared set entirely, not just at
+  permission time, so Claude Code cannot execute anything and the model
+  has no Bash to fall back on. This is the §4 "hosted/self-executing
+  tools must never be declared" rule applied to a CLI instead of an API.
+  (`--allowed-tools ""` was insufficient: the model still saw a Bash
+  tool and used it instead of ocha's protocol.)
+- **`--system-prompt` always set** to an `AGENTIC_SYSTEM` preamble (plus
+  any caller system prompt). It replaces Claude Code's default agent
+  persona and tells the now-tool-less model that the only way to act is
+  ocha's plain-text `!!!OCHA_RUN_CMD` protocol. Result: claude-cli does
+  both plain chat *and* the agentic loop identically to a tool-less
+  Ollama model, with ocha still the single approval/execution point.
 - **`--no-session-persistence`** — state stays ocha's neutral
   resent-history `Vec<Message>`, not Claude Code's session store.
 

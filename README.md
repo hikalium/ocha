@@ -7,18 +7,17 @@ interface. Supported backends:
 - **`claude`** — the Anthropic Messages API (`/v1/messages`).
 - **`claude-cli`** — the locally installed, already-authenticated
   `claude` (Claude Code) CLI in print mode. No `ANTHROPIC_API_KEY`
-  needed; used strictly as a text-completion engine (Claude Code's own
-  tools/agent loop are disabled, so ocha keeps the single approval
-  point). Trades the design note's "build on the primitive API" stance
-  for zero-setup auth — see that note's §4 for the caveat.
+  needed. Claude Code's own built-in tools are removed (`--tools ""`)
+  and a system preamble makes it speak ocha's plain-text protocol, so it
+  behaves like any other backend (plain chat *and* agentic) while ocha
+  stays the single approval point. Trades the design note's "build on
+  the primitive API" stance for zero-setup auth — see that note's §4.
 
 ocha owns its own agent loop, so the agentic command protocol is plain
-text and works the same on the `ollama` and `claude` backends regardless
-of native tool support. The `claude-cli` backend is the exception: the
-Claude Code front-end runs its *own* agent loop and tends to ignore
-ocha's plain-text protocol (its own tools are disabled), so use
-`claude-cli` for plain chat, not for agentic command execution — see
-[Command Execution](#command-execution-agentic-capabilities).
+text and works the same on **every** backend regardless of native tool
+support — including `claude-cli`, where Claude Code's own built-in tools
+are removed (`--tools ""`) and a system preamble makes it speak ocha's
+plain-text protocol just like a tool-less local model.
 
 The design rationale for this architecture — why ocha owns its loop and
 approval point rather than using a vendor agent SDK, and the
@@ -130,13 +129,13 @@ The `init` field (default: `false`) determines if the reminder is only applied a
 **Safety Limits:**
 - `--command-per-response`: Limits the number of chained commands per user turn (default: 5).
 
-> **Backend note.** This protocol is reliable on `ollama` and `claude`
-> (verified: ocha intercepts `!!!OCHA_RUN_CMD`, executes, and feeds the
-> result back). On **`claude-cli`** the model is Claude Code, which has
-> its own agent loop and disabled built-in tools; in practice it ignores
-> the plain-text protocol rather than emitting it, so agentic command
-> execution does **not** work there. `claude-cli` is intended for plain
-> chat / completion only.
+> **Backend note.** Verified on all three backends (ocha intercepts
+> `!!!OCHA_RUN_CMD`, executes, and feeds the result back). For
+> **`claude-cli`** this is achieved by removing Claude Code's built-in
+> tools (`--tools ""`) and prepending a system preamble that directs it
+> to ocha's plain-text protocol — so it behaves like a tool-less local
+> model and can never execute anything itself; ocha remains the single
+> approval point.
 
 ### Examples
 
