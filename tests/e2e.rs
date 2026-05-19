@@ -4,9 +4,13 @@ use tempfile::NamedTempFile;
 #[allow(deprecated)]
 #[test]
 fn test_session_persistence() {
+    // Ollama host is overridable so the E2E test can target a remote
+    // server (e.g. OCHA_TEST_OLLAMA_HOST=eevee). Defaults to localhost.
+    let host = std::env::var("OCHA_TEST_OLLAMA_HOST").unwrap_or_else(|_| "localhost".to_string());
+
     // Check if Ollama is running first. If not, skip the test.
-    if reqwest::blocking::get("http://localhost:11434").is_err() {
-        eprintln!("Ollama server not found at localhost:11434, skipping E2E test.");
+    if reqwest::blocking::get(format!("http://{host}:11434")).is_err() {
+        eprintln!("Ollama server not found at {host}:11434, skipping E2E test.");
         return;
     }
 
@@ -15,7 +19,9 @@ fn test_session_persistence() {
 
     // Step 1: Tell the model a specific fact
     let mut cmd = Command::cargo_bin("ocha").unwrap();
-    cmd.arg("-S")
+    cmd.arg("-s")
+        .arg(&host)
+        .arg("-S")
         .arg(session_path)
         .arg("My secret word is 'XEBRA'. Remember it.")
         .assert()
@@ -24,6 +30,8 @@ fn test_session_persistence() {
     // Step 2: Ask the model for the fact using the session
     let mut cmd = Command::cargo_bin("ocha").unwrap();
     let assert = cmd
+        .arg("-s")
+        .arg(&host)
         .arg("-S")
         .arg(session_path)
         .arg("What is my secret word?")
