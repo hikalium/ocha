@@ -80,6 +80,41 @@ struct ModelsResponse {
     data: Vec<ApiModel>,
 }
 
+/// Provider-specific seam: Anthropic carries the system prompt out of
+/// band. Any System-role turns in the history are merged into it (joined
+/// by blank lines, `None` when there are none); the rest map to the two
+/// chat roles (a text tool-result is just another user turn). The
+/// upcoming Gemini backend mirrors this exact split (see GEMINI.md).
+fn split_system_and_messages(
+    system: Option<&str>,
+    messages: &[Message],
+) -> (Option<String>, Vec<WireMessage>) {
+    let mut system_parts: Vec<String> = Vec::new();
+    if let Some(s) = system {
+        system_parts.push(s.to_string());
+    }
+    let mut wire: Vec<WireMessage> = Vec::with_capacity(messages.len());
+    for m in messages {
+        match m.role {
+            Role::System => system_parts.push(m.content.clone()),
+            Role::Assistant => wire.push(WireMessage {
+                role: "assistant",
+                content: m.content.clone(),
+            }),
+            Role::User | Role::Tool => wire.push(WireMessage {
+                role: "user",
+                content: m.content.clone(),
+            }),
+        }
+    }
+    let system = if system_parts.is_empty() {
+        None
+    } else {
+        Some(system_parts.join("\n\n"))
+    };
+    (system, wire)
+}
+
 #[async_trait::async_trait]
 impl Backend for ClaudeBackend {
     async fn chat(
@@ -88,37 +123,13 @@ impl Backend for ClaudeBackend {
         messages: &[Message],
         on_token: &mut TokenSink<'_>,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        // Anthropic carries the system prompt out of band. Any System-role
-        // turns in the history are merged into it; the rest map to the two
-        // chat roles (a text tool-result is just another user turn).
-        let mut system_parts: Vec<String> = Vec::new();
-        if let Some(s) = system {
-            system_parts.push(s.to_string());
-        }
-        let mut wire: Vec<WireMessage> = Vec::with_capacity(messages.len());
-        for m in messages {
-            match m.role {
-                Role::System => system_parts.push(m.content.clone()),
-                Role::Assistant => wire.push(WireMessage {
-                    role: "assistant",
-                    content: m.content.clone(),
-                }),
-                Role::User | Role::Tool => wire.push(WireMessage {
-                    role: "user",
-                    content: m.content.clone(),
-                }),
-            }
-        }
+        let (system, wire) = split_system_and_messages(system, messages);
 
         let body = MessagesRequest {
             model: self.model.clone(),
             max_tokens: self.max_tokens,
             stream: true,
-            system: if system_parts.is_empty() {
-                None
-            } else {
-                Some(system_parts.join("\n\n"))
-            },
+            system,
             messages: wire,
         };
 
