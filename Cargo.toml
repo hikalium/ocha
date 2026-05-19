@@ -13,6 +13,12 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.49.0", features = ["full", "io-util"] }
 chrono = { version = "0.4.40", features = ["serde"] }
+# serve mode (design §12.2): all already in the lock via reqwest;
+# promoted to direct deps + `server` feature. No new external crates.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
+http-body-util = "0.1"
+bytes = "1"
 
 [dev-dependencies]
 assert_cmd = "2.1.2"

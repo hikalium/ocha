@@ -642,10 +642,11 @@ v1.8.1` / `hyper-util v0.1.20` are compiled with **client features only**
 | Crate | In lock today | Change | Why |
 |---|---|---|---|
 | `hyper` | ✅ 1.8.1 | add as direct dep, `features=["server","http1"]` | HTTP/1.1 server |
-| `hyper-util` | ✅ 0.1.20 | add as direct dep, `features=["server","server-auto","tokio","service"]` | serve connection/IO glue |
+| `hyper-util` | ✅ 0.1.20 | add as direct dep, `features=["tokio","server","server-auto"]` | serve connection/IO glue (`service` not needed — `hyper::service::service_fn` used) |
 | `http-body-util` | ✅ 0.1.3 | add as direct dep | request/response bodies |
 | `http` | ✅ 1.4.0 | direct dep *only if* not re-exported sufficiently by `hyper` | status/headers types |
-| `bytes` | ✅ 1.11.1 | direct dep *only if* needed for body buffering | byte buffers |
+| `bytes` | ✅ 1.11.1 | add as direct dep | `Full<Bytes>` response bodies |
+| `httpdate` | ⚠️ **new** 1.0.3 | **approved 2026-05-20** | pulled transitively by `hyper`'s `server` feature (Date header). Leaf crate, zero sub-deps, hyper-org maintained. Caught by the M2 §12.3 audit and explicitly approved by the user before proceeding; added to `docs/dep-baseline.txt`. |
 | `tokio` | ✅ 1.49.0 (direct, `full`) | **no change** | `net`, `sync::{oneshot,broadcast}`, `io` already enabled by `full` |
 | `serde`, `serde_json`, `async-trait`, `clap`, `futures-util` | ✅ direct | **no change** | JSON, trait, `serve` subcommand, streams |
 
@@ -683,7 +684,8 @@ snapshot lives in **Appendix A** (and a machine-checkable copy at
 
 ## Appendix A — reviewed transitive baseline (audit reference)
 
-Captured 2026-05-20. **129** normal transitive crates + **2** dev-only
+Captured 2026-05-20, **129** normal transitive crates (128 at design
+time + `httpdate`, approved during M2 — see §12.2) + **2** dev-only
 (`assert_cmd`, `tempfile`). This is the reviewed pre-image; the §12.3
 audit diffs against it every milestone. (Versions omitted here for
 readability; the exact pinned snapshot is `docs/dep-baseline.txt`,
@@ -696,7 +698,8 @@ clap clap_builder clap_derive clap_lex colorchoice cpufeatures
 displaydoc encoding_rs equivalent errno fnv form_urlencoded
 futures-channel futures-core futures-io futures-macro futures-sink
 futures-task futures-util getrandom h2 hashbrown heck http http-body
-http-body-util httparse hyper hyper-rustls hyper-util iana-time-zone
+http-body-util httparse httpdate hyper hyper-rustls hyper-util
+iana-time-zone
 icu_collections icu_locale_core icu_normalizer icu_normalizer_data
 icu_properties icu_properties_data icu_provider idna idna_adapter
 indexmap ipnet iri-string is_terminal_polyfill itoa libc litemap
