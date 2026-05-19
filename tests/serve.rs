@@ -330,3 +330,190 @@ fn serve_conversation_sse_hermetic() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+// ---- M4: remote approval gate ----
+
+const M4_SCRIPT: &str = "running\n!!!OCHA_RUN_CMD{\"binary\":\"echo\",\"args\":[\"m4ok\"],\"timeout\":5,\"description\":\"e\"}<<<NEXT>>>all finished";
+
+fn create_session(c: &reqwest::blocking::Client, base: &str) -> String {
+    let v: serde_json::Value = c
+        .post(format!("{base}/api/sessions"))
+        .body("{}")
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    v["id"].as_str().unwrap().to_string()
+}
+
+/// Poll GET until `pending_command` appears; return its cmd_id.
+fn poll_pending(
+    c: &reqwest::blocking::Client,
+    base: &str,
+    id: &str,
+) -> (String, serde_json::Value) {
+    for _ in 0..100 {
+        let g: serde_json::Value = c
+            .get(format!("{base}/api/sessions/{id}"))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        if !g["pending_command"].is_null() {
+            assert_eq!(g["state"], "awaiting_approval");
+            return (
+                g["pending_command"]["cmd_id"].as_str().unwrap().to_string(),
+                g,
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("command_pending never appeared");
+}
+
+/// Poll GET until the turn returns to idle; return the final snapshot.
+fn poll_idle(c: &reqwest::blocking::Client, base: &str, id: &str) -> serde_json::Value {
+    for _ in 0..200 {
+        let g: serde_json::Value = c
+            .get(format!("{base}/api/sessions/{id}"))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        if g["state"] == "idle" && g["messages"].as_array().unwrap().len() >= 3 {
+            return g;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("turn never returned to idle");
+}
+
+fn tool_msg(g: &serde_json::Value) -> String {
+    g["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("no tool message")["content"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn serve_approval_approve_hermetic() {
+    let (mut child, base) = spawn_server_env(&[
+        ("OCHA_MOCK_REPLY", M4_SCRIPT),
+        ("OCHA_APPROVAL_TIMEOUT_SECS", "30"),
+    ]);
+    let c = reqwest::blocking::Client::new();
+    let id = create_session(&c, &base);
+
+    let post = c
+        .post(format!("{base}/api/sessions/{id}/messages"))
+        .body(r#"{"content":"go"}"#)
+        .send()
+        .unwrap();
+    assert_eq!(post.status().as_u16(), 202);
+
+    let (cmd_id, snap) = poll_pending(&c, &base, &id);
+    assert_eq!(snap["pending_command"]["request"]["binary"], "echo");
+
+    // Stale / unknown cmd_id -> 404 while a real one is pending.
+    let bogus = c
+        .post(format!(
+            "{base}/api/sessions/{id}/commands/c_deadbeef/approve"
+        ))
+        .send()
+        .unwrap();
+    assert_eq!(bogus.status().as_u16(), 404);
+
+    // Approve the real one.
+    let ok = c
+        .post(format!(
+            "{base}/api/sessions/{id}/commands/{cmd_id}/approve"
+        ))
+        .send()
+        .unwrap();
+    assert_eq!(ok.status().as_u16(), 200);
+
+    let g = poll_idle(&c, &base, &id);
+    let tool = tool_msg(&g);
+    assert!(
+        tool.contains("\"status\":0"),
+        "tool result not status 0: {tool}"
+    );
+    assert!(tool.contains("m4ok"), "command stdout missing: {tool}");
+    // Re-approving the now-consumed cmd_id -> 404.
+    let again = c
+        .post(format!(
+            "{base}/api/sessions/{id}/commands/{cmd_id}/approve"
+        ))
+        .send()
+        .unwrap();
+    assert_eq!(again.status().as_u16(), 404);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn serve_approval_deny_hermetic() {
+    let (mut child, base) = spawn_server_env(&[
+        ("OCHA_MOCK_REPLY", M4_SCRIPT),
+        ("OCHA_APPROVAL_TIMEOUT_SECS", "30"),
+    ]);
+    let c = reqwest::blocking::Client::new();
+    let id = create_session(&c, &base);
+
+    c.post(format!("{base}/api/sessions/{id}/messages"))
+        .body(r#"{"content":"go"}"#)
+        .send()
+        .unwrap();
+    let (cmd_id, _) = poll_pending(&c, &base, &id);
+
+    let d = c
+        .post(format!("{base}/api/sessions/{id}/commands/{cmd_id}/deny"))
+        .body(r#"{"reason":"no network access"}"#)
+        .send()
+        .unwrap();
+    assert_eq!(d.status().as_u16(), 200);
+
+    let g = poll_idle(&c, &base, &id);
+    let tool = tool_msg(&g);
+    assert!(
+        tool.contains("denied by operator") && tool.contains("no network access"),
+        "deny reason not fed back: {tool}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn serve_approval_timeout_hermetic() {
+    let (mut child, base) = spawn_server_env(&[
+        ("OCHA_MOCK_REPLY", M4_SCRIPT),
+        ("OCHA_APPROVAL_TIMEOUT_SECS", "1"),
+    ]);
+    let c = reqwest::blocking::Client::new();
+    let id = create_session(&c, &base);
+
+    c.post(format!("{base}/api/sessions/{id}/messages"))
+        .body(r#"{"content":"go"}"#)
+        .send()
+        .unwrap();
+    poll_pending(&c, &base, &id);
+
+    // Do nothing; the 1s gate auto-denies and the turn still completes.
+    let g = poll_idle(&c, &base, &id);
+    let tool = tool_msg(&g);
+    assert!(
+        tool.contains("approval timed out"),
+        "auto-deny reason missing: {tool}"
+    );
+    assert_eq!(g["state"], "idle");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
