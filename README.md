@@ -12,8 +12,13 @@ interface. Supported backends:
   point). Trades the design note's "build on the primitive API" stance
   for zero-setup auth — see that note's §4 for the caveat.
 
-ocha owns its own agent loop, so the agentic command protocol is plain text
-and works identically on every backend regardless of native tool support.
+ocha owns its own agent loop, so the agentic command protocol is plain
+text and works the same on the `ollama` and `claude` backends regardless
+of native tool support. The `claude-cli` backend is the exception: the
+Claude Code front-end runs its *own* agent loop and tends to ignore
+ocha's plain-text protocol (its own tools are disabled), so use
+`claude-cli` for plain chat, not for agentic command execution — see
+[Command Execution](#command-execution-agentic-capabilities).
 
 The design rationale for this architecture — why ocha owns its loop and
 approval point rather than using a vendor agent SDK, and the
@@ -124,6 +129,14 @@ The `init` field (default: `false`) determines if the reminder is only applied a
 
 **Safety Limits:**
 - `--command-per-response`: Limits the number of chained commands per user turn (default: 5).
+
+> **Backend note.** This protocol is reliable on `ollama` and `claude`
+> (verified: ocha intercepts `!!!OCHA_RUN_CMD`, executes, and feeds the
+> result back). On **`claude-cli`** the model is Claude Code, which has
+> its own agent loop and disabled built-in tools; in practice it ignores
+> the plain-text protocol rather than emitting it, so agentic command
+> execution does **not** work there. `claude-cli` is intended for plain
+> chat / completion only.
 
 ### Examples
 
