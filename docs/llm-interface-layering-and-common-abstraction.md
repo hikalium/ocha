@@ -159,6 +159,33 @@ approval/execution point; the `!!!OCHA_RUN_CMD` plain-text protocol is the
 gate (works even on tool-less local models); no backend declares hosted
 tools, so the gate can never be silently bypassed.
 
+### The `claude-cli` backend: a deliberate, contained exception
+
+The `claude-cli` backend talks to the locally installed Claude Code CLI
+(`claude -p --output-format stream-json`) — structurally the upper layer
+this note argues *against*. It exists for exactly one payoff: the CLI is
+already authenticated (OAuth / subscription), so the backend needs no
+`ANTHROPIC_API_KEY` and no billing setup. The contradiction is contained
+by demoting the upper layer to a dumb text-completion engine:
+
+- **Tools disabled** (`--allowed-tools ""`) — Claude Code's own agent
+  loop cannot execute anything, so it cannot bypass ocha's gate. This is
+  the §4 "hosted/self-executing tools must never be declared" rule
+  applied to a CLI instead of an API.
+- **`--system-prompt` always set** (even empty) so the large default
+  agent system prompt is replaced — the model behaves as a completion
+  endpoint, not an agent.
+- **`--no-session-persistence`** — state stays ocha's neutral
+  resent-history `Vec<Message>`, not Claude Code's session store.
+
+Residual exposure is accepted knowingly: the structural non-TTY/pipe
+hang class (§2, claude-agent-sdk-python #926) applies to *this backend
+only*; the API-based `claude`/`ollama` backends remain on the primitive,
+stable layer. Cost note: each call still carries Claude Code's cached
+~24k-token system prompt, so `claude-cli` is not as cheap as the raw
+`claude` API backend at the same model — it buys auth convenience, not
+efficiency.
+
 ---
 
 ## 5. Ollama, and the minimal universal streaming interface

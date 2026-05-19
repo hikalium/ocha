@@ -5,6 +5,12 @@ interface. Supported backends:
 
 - **`ollama`** (default) — a local/network Ollama server (native `/api/chat`).
 - **`claude`** — the Anthropic Messages API (`/v1/messages`).
+- **`claude-cli`** — the locally installed, already-authenticated
+  `claude` (Claude Code) CLI in print mode. No `ANTHROPIC_API_KEY`
+  needed; used strictly as a text-completion engine (Claude Code's own
+  tools/agent loop are disabled, so ocha keeps the single approval
+  point). Trades the design note's "build on the primitive API" stance
+  for zero-setup auth — see that note's §4 for the caveat.
 
 ocha owns its own agent loop, so the agentic command protocol is plain text
 and works identically on every backend regardless of native tool support.
@@ -19,6 +25,9 @@ lowest-common-denominator interface across the supported backends — is in
 - **Rust toolchain**: Installed via [rustup](https://rustup.rs/).
 - **Ollama** (for the `ollama` backend): a server running and reachable.
 - **`ANTHROPIC_API_KEY`** (for the `claude` backend): exported in the env.
+- **Claude Code CLI** (for the `claude-cli` backend): `claude` installed,
+  on `PATH`, and logged in (`claude` once interactively, or `claude
+  login`). No API key required.
 
 ## Installation
 
@@ -58,7 +67,7 @@ ocha -S my_chat.json "What is my name?"
 
 | Flag | Long Flag | Description | Default |
 |------|-----------|-------------|---------|
-|      | `--backend`| Backend: `ollama` or `claude` | `ollama` |
+|      | `--backend`| Backend: `ollama`, `claude`, or `claude-cli` | `ollama` |
 | `-s` | `--server`| IP address of the Ollama server (ollama only) | `127.0.0.1` |
 | `-p` | `--port`  | Port of the Ollama server (ollama only) | `11434` |
 |      | `--api-base`| Override API base URL | per-backend |
@@ -82,6 +91,11 @@ ocha -m llama3 "What is Rust?"
 export ANTHROPIC_API_KEY=sk-ant-...
 ocha --backend claude "Explain ownership in one sentence."
 ocha --backend claude -m claude-sonnet-4-6 --system "Be terse." "Hi"
+
+# Claude via the installed Claude Code CLI (no API key; uses its login)
+ocha --backend claude-cli "Explain ownership in one sentence."
+ocha --backend claude-cli -m haiku --system "Be terse." "Hi"
+# OCHA_CLAUDE_CLI overrides the binary path if `claude` is not on PATH.
 ```
 
 ### Reminders
@@ -139,6 +153,7 @@ always green offline.
 |------|-----------|----------------|
 | `test_session_persistence_ollama` | an Ollama server is reachable | `OCHA_TEST_OLLAMA_HOST` (default `localhost`; passed to `ocha` via `-s`) |
 | `test_session_persistence_claude` | `ANTHROPIC_API_KEY` is set | `OCHA_TEST_CLAUDE_MODEL` (default `claude-haiku-4-5-20251001`, kept cheap) |
+| `test_session_persistence_claude_cli` | `OCHA_TEST_CLAUDE_CLI=1` **and** `claude` on `PATH` (opt-in: spends real subscription budget) | `OCHA_TEST_CLAUDE_MODEL` (default `haiku`) |
 
 ```bash
 # Ollama backend against a remote server
@@ -147,7 +162,10 @@ OCHA_TEST_OLLAMA_HOST=eevee cargo test --test e2e -- --nocapture
 # Claude backend (live Anthropic API — a small paid round trip)
 ANTHROPIC_API_KEY=sk-ant-... cargo test --test e2e -- --nocapture
 
-# Both backends in one run
+# claude-cli backend (opt-in; uses the CLI's login, no API key)
+OCHA_TEST_CLAUDE_CLI=1 cargo test --test e2e -- --nocapture
+
+# All backends in one run
 ANTHROPIC_API_KEY=sk-ant-... OCHA_TEST_OLLAMA_HOST=eevee \
-  cargo test --test e2e -- --nocapture
+  OCHA_TEST_CLAUDE_CLI=1 cargo test --test e2e -- --nocapture
 ```

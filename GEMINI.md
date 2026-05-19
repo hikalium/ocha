@@ -24,9 +24,16 @@ This document provides context for AI agents (like Gemini) to assist in the ongo
 > `!!!OCHA_RUN_CMD` protocol.
 
 - **Provider-neutral backend trait:** `src/backend/` defines a `Backend`
-  trait (`chat` + `list_models`); `ollama` and `claude` implement it.
-  `main.rs` owns the backend-agnostic turn loop, reminders, logging and
-  the agentic command protocol. Add a new provider by adding one module.
+  trait (`chat` + `list_models`); `ollama`, `claude` and `claude_cli`
+  implement it. `main.rs` owns the backend-agnostic turn loop, reminders,
+  logging and the agentic command protocol. Add a new provider by adding
+  one module.
+- **`claude-cli` is a contained upper-layer exception:** it shells out to
+  the installed Claude Code CLI so no API key is needed, but only as a
+  tools-disabled text engine. The full rationale and the invariant that
+  keeps ocha's approval gate intact are in the design note's §4
+  ("The `claude-cli` backend: a deliberate, contained exception"). Read
+  it before touching that backend.
 - **Neutral conversation model:** sessions are a `Vec<Message>` of
   role-tagged text (resent each turn — the lowest common denominator that
   works across Ollama, Anthropic and Gemini). The Ollama-only opaque
@@ -47,6 +54,7 @@ This document provides context for AI agents (like Gemini) to assist in the ongo
 - [x] Enhanced API Interaction (`list-models` for every backend)
 - [x] Multi-turn chat using `/api/chat` (neutral message history)
 - [x] Provider-neutral backend trait (Ollama + Claude)
+- [x] `claude-cli` backend (installed Claude Code CLI; no API key)
 - [ ] **Gemini backend** (see plan below)
 - [ ] CLI Polish (colorized output, better error handling)
 
