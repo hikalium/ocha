@@ -73,3 +73,28 @@ fn test_session_persistence_claude() {
 
     assert_session_recall(&["--backend", "claude", "-m", &model]);
 }
+
+#[test]
+fn test_session_persistence_claude_cli() {
+    // Double-gated. Unlike a local Ollama or an explicitly-exported API
+    // key, the `claude` binary is "always present" on a dev box and would
+    // spend real subscription budget on every `cargo test` — so this is
+    // opt-in (OCHA_TEST_CLAUDE_CLI=1) *and* requires the CLI on PATH.
+    if std::env::var("OCHA_TEST_CLAUDE_CLI").as_deref() != Ok("1") {
+        eprintln!("OCHA_TEST_CLAUDE_CLI != 1, skipping claude-cli E2E test.");
+        return;
+    }
+    if std::process::Command::new("claude")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("`claude` CLI not found on PATH, skipping claude-cli E2E test.");
+        return;
+    }
+
+    // Cheap alias by default; the CLI accepts opus/sonnet/haiku.
+    let model = std::env::var("OCHA_TEST_CLAUDE_MODEL").unwrap_or_else(|_| "haiku".to_string());
+
+    assert_session_recall(&["--backend", "claude-cli", "-m", &model]);
+}
