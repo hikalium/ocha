@@ -129,12 +129,25 @@ ocha -m llama3 "What is Rust?"
 cargo test
 ```
 
-Unit tests run anywhere. The end-to-end session-persistence test
-(`tests/e2e.rs`) needs a reachable Ollama server; it **skips itself**
-when none is found. By default it looks at `localhost:11434`. Point it
-at a remote server with `OCHA_TEST_OLLAMA_HOST` (the test passes this to
-`ocha` via `-s`):
+Unit tests run anywhere. The end-to-end tests (`tests/e2e.rs`) run the
+same provider-neutral session-recall flow (persist a fact in one
+process, recall it in a second) against each backend, and **each one
+skips itself** when its backend is unavailable — so `cargo test` is
+always green offline.
+
+| Test | Runs when | Configure with |
+|------|-----------|----------------|
+| `test_session_persistence_ollama` | an Ollama server is reachable | `OCHA_TEST_OLLAMA_HOST` (default `localhost`; passed to `ocha` via `-s`) |
+| `test_session_persistence_claude` | `ANTHROPIC_API_KEY` is set | `OCHA_TEST_CLAUDE_MODEL` (default `claude-haiku-4-5-20251001`, kept cheap) |
 
 ```bash
+# Ollama backend against a remote server
 OCHA_TEST_OLLAMA_HOST=eevee cargo test --test e2e -- --nocapture
+
+# Claude backend (live Anthropic API — a small paid round trip)
+ANTHROPIC_API_KEY=sk-ant-... cargo test --test e2e -- --nocapture
+
+# Both backends in one run
+ANTHROPIC_API_KEY=sk-ant-... OCHA_TEST_OLLAMA_HOST=eevee \
+  cargo test --test e2e -- --nocapture
 ```
