@@ -394,31 +394,56 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
+/// Everything needed to construct a backend, decoupled from CLI parsing
+/// so the future `serve` mode can build one per session from an API
+/// request rather than from `Args`.
+struct BackendConfig {
+    backend: BackendKind,
+    server: String,
+    port: u16,
+    api_base: Option<String>,
+    model: Option<String>,
+    max_tokens: u32,
+}
+
+impl BackendConfig {
+    fn from_args(args: &Args) -> Self {
+        Self {
+            backend: args.backend,
+            server: args.server.clone(),
+            port: args.port,
+            api_base: args.api_base.clone(),
+            model: args.model.clone(),
+            max_tokens: args.max_tokens,
+        }
+    }
+}
+
 fn build_backend(
-    args: &Args,
+    cfg: &BackendConfig,
     client: reqwest::Client,
 ) -> Result<Box<dyn Backend>, Box<dyn std::error::Error>> {
-    match args.backend {
+    match cfg.backend {
         BackendKind::Ollama => {
-            let base = args
+            let base = cfg
                 .api_base
                 .clone()
-                .unwrap_or_else(|| format!("http://{}:{}", args.server, args.port));
-            let model = args
+                .unwrap_or_else(|| format!("http://{}:{}", cfg.server, cfg.port));
+            let model = cfg
                 .model
                 .clone()
                 .unwrap_or_else(|| "gemma3:27b".to_string());
             Ok(Box::new(OllamaBackend::new(client, base, model)))
         }
         BackendKind::Claude => {
-            let base = args
+            let base = cfg
                 .api_base
                 .clone()
                 .unwrap_or_else(|| "https://api.anthropic.com".to_string());
             let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(
                 |_| "ANTHROPIC_API_KEY environment variable is required for the claude backend",
             )?;
-            let model = args
+            let model = cfg
                 .model
                 .clone()
                 .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
@@ -427,14 +452,14 @@ fn build_backend(
                 base,
                 api_key,
                 model,
-                args.max_tokens,
+                cfg.max_tokens,
             )))
         }
         BackendKind::ClaudeCli => {
             // Uses the CLI's own login (OAuth/subscription); no API key.
             // Binary is overridable for non-standard installs / tests.
             let binary = std::env::var("OCHA_CLAUDE_CLI").unwrap_or_else(|_| "claude".to_string());
-            Ok(Box::new(ClaudeCliBackend::new(binary, args.model.clone())))
+            Ok(Box::new(ClaudeCliBackend::new(binary, cfg.model.clone())))
         }
     }
 }
@@ -443,7 +468,7 @@ fn build_backend(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let client = reqwest::Client::new();
-    let backend = build_backend(&args, client)?;
+    let backend = build_backend(&BackendConfig::from_args(&args), client)?;
 
     if args.list_models {
         let models = backend.list_models().await?;
