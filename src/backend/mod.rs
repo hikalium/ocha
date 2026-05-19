@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod claude;
 pub mod claude_cli;
+pub mod mock;
 pub mod ollama;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]

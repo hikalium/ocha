@@ -11,6 +11,7 @@ mod backend;
 mod turn;
 use backend::claude::ClaudeBackend;
 use backend::claude_cli::ClaudeCliBackend;
+use backend::mock::MockBackend;
 use backend::ollama::OllamaBackend;
 use backend::{Backend, Message, Role, Session};
 use turn::{AutoApprover, CommandApprover, Decision, StdoutObserver, TurnObserver};
@@ -423,6 +424,12 @@ fn build_backend(
     cfg: &BackendConfig,
     client: reqwest::Client,
 ) -> Result<Box<dyn Backend>, Box<dyn std::error::Error>> {
+    // Test-only hermetic backend, reachable solely via the env switch
+    // (never the CLI surface). Lets `ocha serve` integration tests run
+    // without a real model or network.
+    if std::env::var("OCHA_MOCK_BACKEND").as_deref() == Ok("1") {
+        return Ok(Box::new(MockBackend));
+    }
     match cfg.backend {
         BackendKind::Ollama => {
             let base = cfg
