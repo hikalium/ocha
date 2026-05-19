@@ -1,4 +1,4 @@
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
@@ -8,6 +8,7 @@ use tokio::io::AsyncReadExt;
 use tokio::time::{Duration, timeout};
 
 mod backend;
+mod serve;
 mod turn;
 use backend::claude::ClaudeBackend;
 use backend::claude_cli::ClaudeCliBackend;
@@ -80,6 +81,21 @@ struct Args {
 
     /// The prompt to send to the model. If omitted, starts interactive mode.
     prompt: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Run the local web-UI / remote-control server (localhost only).
+    /// Top-level options (--backend, -m, --system, …) become the
+    /// defaults for new sessions; the API can override per session.
+    Serve {
+        /// Port to bind on 127.0.0.1 (0 = OS-assigned).
+        #[arg(long, default_value = "8765")]
+        port: u16,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -398,6 +414,7 @@ async fn run_turn(config: RunTurnConfig<'_>) -> Result<(), Box<dyn std::error::E
 /// Everything needed to construct a backend, decoupled from CLI parsing
 /// so the future `serve` mode can build one per session from an API
 /// request rather than from `Args`.
+#[derive(Clone)]
 struct BackendConfig {
     backend: BackendKind,
     server: String,
@@ -474,6 +491,25 @@ fn build_backend(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    // Serve mode is its own thing (mutually exclusive with the REPL):
+    // top-level flags become per-session defaults, then we hand off to
+    // the HTTP server and never return.
+    if let Some(Command::Serve { port }) = args.command {
+        let reminders: Vec<Reminder> = if let Some(ref path) = args.reminders {
+            serde_json::from_str(&std::fs::read_to_string(path)?)?
+        } else {
+            Vec::new()
+        };
+        let defaults = serve::ServeDefaults {
+            backend_cfg: BackendConfig::from_args(&args),
+            system: args.system.clone(),
+            command_per_response: args.command_per_response,
+            reminders,
+        };
+        return serve::run(defaults, port).await;
+    }
+
     let client = reqwest::Client::new();
     let backend = build_backend(&BackendConfig::from_args(&args), client)?;
 

@@ -57,8 +57,11 @@ pub struct ModelInfo {
 /// A token sink: backends call this with each text fragment as it streams.
 pub type TokenSink<'a> = dyn FnMut(&str) + Send + 'a;
 
+// `Send + Sync`: backends are shared across async server tasks in
+// `serve` mode (held in an `Arc`, used across `.await`). Every impl
+// already qualifies (they hold only `reqwest::Client`/`String`).
 #[async_trait::async_trait]
-pub trait Backend {
+pub trait Backend: Send + Sync {
     /// Run one turn: send `system` + `messages`, stream text to `on_token`,
     /// and return the full assembled assistant text.
     async fn chat(
