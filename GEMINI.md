@@ -14,6 +14,15 @@ This document provides context for AI agents (like Gemini) to assist in the ongo
 - **Default Model:** `gemma3:27b` (Adjusted to match local environment availability).
 
 ## Architecture Decisions
+
+> **Design rationale:** the *why* behind everything below — the
+> provider-agnostic agent loop, the single approval/execution point, and
+> the lowest-common-denominator interface across Anthropic / Gemini /
+> OpenAI / Ollama — is recorded in
+> [`docs/llm-interface-layering-and-common-abstraction.md`](docs/llm-interface-layering-and-common-abstraction.md).
+> Read it before changing backends, the turn loop, or the
+> `!!!OCHA_RUN_CMD` protocol.
+
 - **Provider-neutral backend trait:** `src/backend/` defines a `Backend`
   trait (`chat` + `list_models`); `ollama` and `claude` implement it.
   `main.rs` owns the backend-agnostic turn loop, reminders, logging and

@@ -9,6 +9,11 @@ interface. Supported backends:
 ocha owns its own agent loop, so the agentic command protocol is plain text
 and works identically on every backend regardless of native tool support.
 
+The design rationale for this architecture — why ocha owns its loop and
+approval point rather than using a vendor agent SDK, and the
+lowest-common-denominator interface across the supported backends — is in
+[`docs/llm-interface-layering-and-common-abstraction.md`](docs/llm-interface-layering-and-common-abstraction.md).
+
 ## Prerequisites
 
 - **Rust toolchain**: Installed via [rustup](https://rustup.rs/).
