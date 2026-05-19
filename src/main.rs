@@ -9,14 +9,18 @@ use tokio::time::{Duration, timeout};
 
 mod backend;
 use backend::claude::ClaudeBackend;
+use backend::claude_cli::ClaudeCliBackend;
 use backend::ollama::OllamaBackend;
 use backend::{Backend, Message, Role, Session};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-#[clap(rename_all = "lowercase")]
+#[clap(rename_all = "kebab-case")]
 enum BackendKind {
     Ollama,
     Claude,
+    /// Shell out to the locally installed, already-authenticated `claude`
+    /// (Claude Code) CLI — no ANTHROPIC_API_KEY needed.
+    ClaudeCli,
 }
 
 #[derive(Parser, Debug)]
@@ -404,6 +408,12 @@ fn build_backend(
                 model,
                 args.max_tokens,
             )))
+        }
+        BackendKind::ClaudeCli => {
+            // Uses the CLI's own login (OAuth/subscription); no API key.
+            // Binary is overridable for non-standard installs / tests.
+            let binary = std::env::var("OCHA_CLAUDE_CLI").unwrap_or_else(|_| "claude".to_string());
+            Ok(Box::new(ClaudeCliBackend::new(binary, args.model.clone())))
         }
     }
 }
