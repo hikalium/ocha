@@ -12,8 +12,11 @@
 //! `hyper`/`hyper-util` + a hand-rolled SSE stream (`futures_util`),
 //! per the §1.1 minimal-dependency policy — no framework.
 
-use crate::turn::{AutoApprover, TurnObserver};
-use crate::{BackendConfig, Reminder, Role, RunTurnConfig, Session, build_backend, run_turn};
+use crate::turn::{AutoApprover, CommandApprover, Decision, TurnObserver};
+use crate::{
+    BackendConfig, CommandRequest, Reminder, Role, RunTurnConfig, Session, build_backend, run_turn,
+};
+use async_trait::async_trait;
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
@@ -31,7 +34,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 
 /// Unified response body: JSON replies and the SSE stream both box into
 /// this so one handler signature serves both.
@@ -48,6 +51,7 @@ struct SseMsg {
 enum SessionState {
     Idle,
     Generating,
+    AwaitingApproval,
 }
 
 impl SessionState {
@@ -55,8 +59,16 @@ impl SessionState {
         match self {
             SessionState::Idle => "idle",
             SessionState::Generating => "generating",
+            SessionState::AwaitingApproval => "awaiting_approval",
         }
     }
+}
+
+/// A command parked on the remote approval gate.
+struct Pending {
+    cmd_id: String,
+    request: CommandRequest,
+    responder: oneshot::Sender<Decision>,
 }
 
 /// CLI-derived defaults for new sessions (decision: top-level args =
@@ -87,10 +99,13 @@ struct SessionRecord {
     state: SessionState,
     /// Live event fan-out: every connected SSE client subscribes here.
     tx: broadcast::Sender<SseMsg>,
+    /// Set while `state == AwaitingApproval`; the gate awaits its responder.
+    pending: Option<Pending>,
     // Materials to run a turn (resolved from defaults + create request).
     backend_cfg: BackendConfig,
     system: Option<String>,
     command_per_response: usize,
+    approval_mode: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -107,10 +122,79 @@ struct SendMessageReq {
     content: String,
 }
 
+#[derive(Deserialize, Default)]
+struct DenyReq {
+    reason: Option<String>,
+}
+
 struct AppState {
     sessions: Mutex<HashMap<String, SessionRecord>>,
     next_id: AtomicU64,
+    next_cmd: AtomicU64,
     defaults: ServeDefaults,
+}
+
+/// `CommandApprover` that parks the turn until a remote approve/deny (or
+/// a timeout) resolves it — the §4 design realized as a single `await`
+/// inside ocha's own loop. Best-effort SSE broadcast; ocha stays the
+/// single execution point.
+struct RemoteApprover {
+    state: Arc<AppState>,
+    id: String,
+    tx: broadcast::Sender<SseMsg>,
+    timeout: Duration,
+}
+
+#[async_trait]
+impl CommandApprover for RemoteApprover {
+    async fn decide(&self, req: &CommandRequest) -> Decision {
+        let n = self.state.next_cmd.fetch_add(1, Ordering::SeqCst);
+        let cmd_id = format!("c_{n:x}");
+        let (otx, orx) = oneshot::channel::<Decision>();
+
+        {
+            let mut map = self.state.sessions.lock().unwrap();
+            let Some(r) = map.get_mut(&self.id) else {
+                return Decision::Deny {
+                    reason: "session gone".into(),
+                };
+            };
+            r.state = SessionState::AwaitingApproval;
+            r.pending = Some(Pending {
+                cmd_id: cmd_id.clone(),
+                request: req.clone(),
+                responder: otx,
+            });
+        }
+        let _ = self.tx.send(SseMsg {
+            event: "command_pending",
+            data: serde_json::json!({ "cmd_id": cmd_id, "request": req }),
+        });
+        let _ = self.tx.send(state_msg("awaiting_approval"));
+
+        let decision = match tokio::time::timeout(self.timeout, orx).await {
+            Ok(Ok(d)) => d,
+            Ok(Err(_)) => Decision::Deny {
+                reason: "approval channel closed".into(),
+            },
+            Err(_) => Decision::Deny {
+                reason: "approval timed out".into(),
+            },
+        };
+
+        // Resume: clear our pending entry (if still ours) and continue.
+        {
+            let mut map = self.state.sessions.lock().unwrap();
+            if let Some(r) = map.get_mut(&self.id) {
+                if r.pending.as_ref().map(|p| p.cmd_id == cmd_id) == Some(true) {
+                    r.pending = None;
+                }
+                r.state = SessionState::Generating;
+            }
+        }
+        let _ = self.tx.send(state_msg("generating"));
+        decision
+    }
 }
 
 /// `TurnObserver` that fans each callback out as an SSE event. Sends are
@@ -166,13 +250,17 @@ fn err(status: StatusCode, msg: &str) -> Response<Body> {
 }
 
 fn snapshot(r: &SessionRecord) -> serde_json::Value {
+    let pending = r
+        .pending
+        .as_ref()
+        .map(|p| serde_json::json!({ "cmd_id": p.cmd_id, "request": p.request }));
     serde_json::json!({
         "id": r.id,
         "state": r.state.as_str(),
         "created_at": r.created_at,
         "config": r.config,
         "messages": r.messages,
-        "pending_command": serde_json::Value::Null,
+        "pending_command": pending,
     })
 }
 
@@ -205,7 +293,7 @@ fn resolve_backend(state: &AppState, name: Option<&str>) -> BackendConfig {
 fn spawn_turn(state: Arc<AppState>, id: String, content: String) {
     tokio::spawn(async move {
         // Snapshot the per-session run materials under the lock.
-        let (backend_cfg, system, cpr, tx, history) = {
+        let (backend_cfg, system, cpr, tx, history, approval_mode) = {
             let map = state.sessions.lock().unwrap();
             let Some(r) = map.get(&id) else { return };
             (
@@ -214,6 +302,7 @@ fn spawn_turn(state: Arc<AppState>, id: String, content: String) {
                 r.command_per_response,
                 r.tx.clone(),
                 r.messages.clone(),
+                r.approval_mode.clone(),
             )
         };
         let is_new = history.is_empty();
@@ -234,7 +323,22 @@ fn spawn_turn(state: Arc<AppState>, id: String, content: String) {
 
         let mut session = Session { messages: history };
         let observer = SseObserver { tx: tx.clone() };
-        let approver = AutoApprover;
+        // `auto` = behave exactly like the CLI; `gated` (serve default)
+        // = the remote approve/deny gate. Timeout configurable for tests.
+        let approver: Box<dyn CommandApprover> = if approval_mode == "auto" {
+            Box::new(AutoApprover)
+        } else {
+            let secs = std::env::var("OCHA_APPROVAL_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(600);
+            Box::new(RemoteApprover {
+                state: state.clone(),
+                id: id.clone(),
+                tx: tx.clone(),
+                timeout: Duration::from_secs(secs),
+            })
+        };
         let cfg = RunTurnConfig {
             backend: &*backend,
             system: system.as_deref(),
@@ -245,7 +349,7 @@ fn spawn_turn(state: Arc<AppState>, id: String, content: String) {
             is_new_session: is_new,
             log_path: None,
             observer: &observer,
-            approver: &approver,
+            approver: &*approver,
         };
 
         let result = run_turn(cfg).await;
@@ -409,9 +513,11 @@ async fn handle(req: Request<Incoming>, state: Arc<AppState>) -> Response<Body> 
                 messages: Vec::new(),
                 state: SessionState::Idle,
                 tx,
+                pending: None,
                 backend_cfg: cfg,
                 system: config.system.clone(),
                 command_per_response: config.command_per_response,
+                approval_mode: config.approval_mode.clone(),
                 config,
             };
             let resp = serde_json::json!({
@@ -494,6 +600,66 @@ async fn handle(req: Request<Incoming>, state: Arc<AppState>) -> Response<Body> 
             )
         }
 
+        (&Method::POST, ["api", "sessions", id, "commands", cmd_id, action])
+            if *action == "approve" || *action == "deny" =>
+        {
+            let id = id.to_string();
+            let cmd_id = cmd_id.to_string();
+            let decision = if *action == "approve" {
+                Decision::Approve
+            } else {
+                let body = req.into_body().collect().await.map(|b| b.to_bytes());
+                let reason = match body {
+                    Ok(b) if !b.is_empty() => serde_json::from_slice::<DenyReq>(&b)
+                        .ok()
+                        .and_then(|d| d.reason)
+                        .unwrap_or_else(|| "denied by operator".into()),
+                    _ => "denied by operator".into(),
+                };
+                Decision::Deny { reason }
+            };
+            // cmd_id must match the *currently pending* command, else
+            // 404 (stale / double-submit / multi-tab race guard).
+            let taken = {
+                let mut map = state.sessions.lock().unwrap();
+                match map.get_mut(&id) {
+                    Some(r) if r.pending.as_ref().map(|p| p.cmd_id == cmd_id) == Some(true) => {
+                        r.pending.take()
+                    }
+                    _ => None,
+                }
+            };
+            match taken {
+                Some(p) => {
+                    let _ = p.responder.send(decision);
+                    json(
+                        StatusCode::OK,
+                        &serde_json::json!({ "state": "generating" }),
+                    )
+                }
+                None => err(StatusCode::NOT_FOUND, "no such pending command"),
+            }
+        }
+
+        (&Method::POST, ["api", "sessions", id, "cancel"]) => {
+            // M4: cancels a *pending approval* (denies it so the turn
+            // unwinds and completes). Full mid-stream stream abort is
+            // future work (design §5).
+            let taken = {
+                let mut map = state.sessions.lock().unwrap();
+                match map.get_mut(*id) {
+                    Some(r) => r.pending.take(),
+                    None => return err(StatusCode::NOT_FOUND, "no such session"),
+                }
+            };
+            if let Some(p) = taken {
+                let _ = p.responder.send(Decision::Deny {
+                    reason: "canceled by operator".into(),
+                });
+            }
+            json(StatusCode::OK, &serde_json::json!({ "canceled": true }))
+        }
+
         _ => err(StatusCode::NOT_FOUND, "not found"),
     }
 }
@@ -503,6 +669,7 @@ pub async fn run(defaults: ServeDefaults, port: u16) -> Result<(), Box<dyn std::
     let state = Arc::new(AppState {
         sessions: Mutex::new(HashMap::new()),
         next_id: AtomicU64::new(1),
+        next_cmd: AtomicU64::new(1),
         defaults,
     });
 
