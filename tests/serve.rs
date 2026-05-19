@@ -42,7 +42,19 @@ fn spawn_server_env(extra: &[(&str, &str)]) -> (Child, String) {
             panic!("ocha serve exited before announcing its address");
         }
         if let Some(idx) = line.find("http://") {
-            return (child, line[idx..].trim().to_string());
+            let base = line[idx..].trim().to_string();
+            // Readiness probe: don't return until the server actually
+            // answers, so tests are deterministic under parallel load.
+            let c = reqwest::blocking::Client::new();
+            for _ in 0..100 {
+                if c.get(format!("{base}/api/health")).send().is_ok() {
+                    return (child, base);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("ocha serve never became ready at {base}");
         }
     }
 }
@@ -513,6 +525,48 @@ fn serve_approval_timeout_hermetic() {
         "auto-deny reason missing: {tool}"
     );
     assert_eq!(g["state"], "idle");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+// ---- M5: embedded web UI ----
+
+#[test]
+fn serve_index_ui_hermetic() {
+    let (mut child, base) = spawn_server();
+    let c = reqwest::blocking::Client::new();
+
+    let r = c.get(format!("{base}/")).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert!(
+        r.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"),
+        "GET / is not text/html"
+    );
+    let body = r.text().unwrap();
+
+    // App is actually there and wired to the API.
+    assert!(body.contains("<title>ocha"), "missing title");
+    assert!(body.contains("EventSource"), "UI doesn't use SSE");
+    assert!(body.contains("/api/sessions"), "UI not wired to the API");
+
+    // §1.1: zero third-party origin — no remote scripts/styles/fonts/CDN.
+    for needle in [
+        "http://",
+        "https://",
+        "//cdn",
+        "unpkg",
+        "googleapis",
+        "jsdelivr",
+    ] {
+        assert!(
+            !body.contains(needle),
+            "embedded UI references an external origin: {needle}"
+        );
+    }
 
     let _ = child.kill();
     let _ = child.wait();
