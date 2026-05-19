@@ -9,12 +9,15 @@
 //!
 //! - **Why:** the CLI is already logged in (OAuth / subscription), so
 //!   this backend needs no `ANTHROPIC_API_KEY` and no billing setup.
-//! - **Invariant:** it is used purely as a text-completion engine —
-//!   tools are disabled (`--allowed-tools ""`) so Claude Code's own
-//!   agent loop can never execute anything, and a `--system-prompt` is
-//!   always passed so the large default agent prompt is replaced. ocha's
-//!   plain-text `!!!OCHA_RUN_CMD` loop stays the single approval/
-//!   execution point exactly as for every other backend.
+//! - **Invariant:** Claude Code's built-in tools are *removed* with
+//!   `--tools ""` (not merely denied), so it can never execute anything
+//!   itself, and a `--system-prompt` (the [`AGENTIC_SYSTEM`] preamble +
+//!   any caller system prompt) replaces its default agent persona. With
+//!   no built-in tools and that preamble, Claude Code behaves like a
+//!   plain tool-less model: it speaks ocha's plain-text
+//!   `!!!OCHA_RUN_CMD` protocol, so this backend works for both plain
+//!   chat *and* the agentic loop — identically to Ollama — while ocha
+//!   stays the single approval/execution point.
 //!
 //! Trade-off to know: each call still carries Claude Code's cached system
 //! prompt (~24k tokens), so it is not as cheap as the raw `claude` API
@@ -36,6 +39,31 @@ impl ClaudeCliBackend {
         Self { binary, model }
     }
 }
+
+/// Standing system instruction that makes Claude Code behave like a
+/// plain model for ocha's agentic loop. Claude Code normally answers as
+/// an agent with its own built-in tools; combined with `--tools ""`
+/// (which *removes* the built-in tools entirely, not just denies them)
+/// this preamble tells the model the only way to act is ocha's
+/// plain-text `!!!OCHA_RUN_CMD` protocol — exactly what a tool-less
+/// Ollama model does. Always prepended, ahead of any user system prompt.
+const AGENTIC_SYSTEM: &str = concat!(
+    "You are a non-interactive backend for the `ocha` CLI. You have NO ",
+    "built-in tools — no Bash, no file tools, nothing. The ONLY way to ",
+    "run a shell command is ocha's plain-text protocol: output a single ",
+    "line that begins with exactly `!!!OCHA_RUN_CMD` immediately followed ",
+    "by a compact JSON object with the keys \"binary\" (string), \"args\" ",
+    "(array of strings), \"timeout\" (integer seconds) and \"description\" ",
+    "(string), e.g.\n",
+    "!!!OCHA_RUN_CMD{\"binary\":\"ls\",\"args\":[\"-la\"],\"timeout\":5,",
+    "\"description\":\"list files\"}\n",
+    "Put that line on its own and stop the turn after it; ocha executes ",
+    "the command and replies with a JSON result ({status,stdout,stderr}) ",
+    "as the next message, then you continue. Never claim to use Bash or ",
+    "any other tool, never ask for permission, and never refuse this ",
+    "protocol — it is the sanctioned, safe mechanism (ocha is the ",
+    "approval point). If no command is needed, just answer normally.",
+);
 
 /// System turns + the out-of-band system prompt are merged (same split as
 /// the `claude` API backend); the remaining turns are flattened to
@@ -104,7 +132,14 @@ impl Backend for ClaudeCliBackend {
         messages: &[Message],
         on_token: &mut TokenSink<'_>,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        let (system_prompt, prompt) = flatten(system, messages);
+        let (user_system, prompt) = flatten(system, messages);
+        // Always lead with the agentic preamble so Claude Code drops its
+        // own agent persona and speaks ocha's plain-text protocol; append
+        // the caller's system prompt (if any) after it.
+        let system_prompt = match user_system {
+            Some(s) => format!("{AGENTIC_SYSTEM}\n\n{s}"),
+            None => AGENTIC_SYSTEM.to_string(),
+        };
 
         let mut cmd = Command::new(&self.binary);
         cmd.arg("-p")
@@ -113,12 +148,14 @@ impl Backend for ClaudeCliBackend {
             .arg("--include-partial-messages")
             .arg("--verbose") // required by the CLI for stream-json + -p
             .arg("--no-session-persistence")
-            .arg("--allowed-tools")
-            .arg("") // tools off: Claude Code must not execute anything
+            // `--tools ""` *removes* the built-in tools (not just denies
+            // them), so the model has no Bash to fall back on and must
+            // use ocha's plain-text protocol — and can never execute
+            // anything itself, keeping ocha the single approval point.
+            .arg("--tools")
+            .arg("")
             .arg("--system-prompt")
-            // Always set one (even empty) so the default agent system
-            // prompt is replaced and this stays a plain completion engine.
-            .arg(system_prompt.as_deref().unwrap_or(""));
+            .arg(&system_prompt);
         if let Some(m) = &self.model {
             cmd.arg("--model").arg(m);
         }
