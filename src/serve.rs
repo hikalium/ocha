@@ -36,6 +36,10 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, oneshot};
 
+/// The single-page UI, embedded at compile time (no build step, zero
+/// third-party JS/CDN — design §1.1).
+const INDEX_HTML: &str = include_str!("../static/index.html");
+
 /// Unified response body: JSON replies and the SSE stream both box into
 /// this so one handler signature serves both.
 type Body = BoxBody<Bytes, Infallible>;
@@ -249,6 +253,14 @@ fn err(status: StatusCode, msg: &str) -> Response<Body> {
     json(status, &serde_json::json!({ "error": msg }))
 }
 
+fn html(body: &'static str) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/html; charset=utf-8")
+        .body(Full::new(Bytes::from_static(body.as_bytes())).boxed())
+        .unwrap()
+}
+
 fn snapshot(r: &SessionRecord) -> serde_json::Value {
     let pending = r
         .pending
@@ -455,6 +467,8 @@ async fn handle(req: Request<Incoming>, state: Arc<AppState>) -> Response<Body> 
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
 
     match (&method, segments.as_slice()) {
+        (&Method::GET, [""]) => html(INDEX_HTML),
+
         (&Method::GET, ["api", "health"]) => json(
             StatusCode::OK,
             &serde_json::json!({ "ok": true, "version": env!("CARGO_PKG_VERSION") }),

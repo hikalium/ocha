@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ocha — remote control</title>
+<style>
+  /* No external fonts/assets — system stack only (design §1.1). */
+  :root { --bg:#101418; --panel:#192029; --line:#2a3340; --fg:#dfe6ee;
+          --mut:#8a97a6; --accent:#5db0ff; --warn:#ffb454; --bad:#ff6b6b; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 system-ui,sans-serif; background:var(--bg);
+         color:var(--fg); height:100vh; display:flex; }
+  #side { width:260px; border-right:1px solid var(--line); display:flex;
+          flex-direction:column; background:var(--panel); }
+  #side h1 { font-size:15px; margin:0; padding:14px; border-bottom:1px solid var(--line); }
+  #side h1 small { color:var(--mut); font-weight:400; }
+  #sessions { flex:1; overflow:auto; }
+  .srow { padding:10px 14px; cursor:pointer; border-bottom:1px solid var(--line);
+          font-size:13px; }
+  .srow:hover { background:#222b36; }
+  .srow.sel { background:#243447; border-left:3px solid var(--accent); }
+  .srow .id { font-family:ui-monospace,monospace; }
+  .srow .st { color:var(--mut); font-size:12px; }
+  #newbox { padding:12px; border-top:1px solid var(--line); display:flex; gap:6px; }
+  #main { flex:1; display:flex; flex-direction:column; min-width:0; }
+  #bar { padding:10px 16px; border-bottom:1px solid var(--line);
+          display:flex; align-items:center; gap:12px; }
+  #pill { font-size:12px; padding:2px 9px; border-radius:10px; background:#243447;
+          color:var(--accent); }
+  #log { flex:1; overflow:auto; padding:16px; }
+  .msg { margin:0 0 12px; }
+  .msg .who { font-size:11px; text-transform:uppercase; letter-spacing:.05em;
+              color:var(--mut); margin-bottom:2px; }
+  .msg.user .who { color:var(--accent); }
+  .msg .body { white-space:pre-wrap; word-break:break-word; }
+  .msg.tool { font-family:ui-monospace,monospace; font-size:12.5px; }
+  .msg.tool .body { background:#0c0f13; border:1px solid var(--line);
+                    border-radius:6px; padding:8px; color:var(--mut); }
+  #live { white-space:pre-wrap; color:var(--fg); opacity:.9; }
+  #gate { margin:0 16px; padding:12px; border:1px solid var(--warn);
+          border-radius:8px; background:#241f12; display:none; }
+  #gate.show { display:block; }
+  #gate code { color:var(--warn); word-break:break-all; }
+  #gate .row { margin-top:8px; display:flex; gap:8px; }
+  #composer { display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line); }
+  textarea,input { background:#0c0f13; color:var(--fg); border:1px solid var(--line);
+                    border-radius:6px; padding:8px; font:inherit; }
+  #prompt { flex:1; resize:none; height:42px; }
+  button { background:var(--accent); color:#06121f; border:0; border-radius:6px;
+           padding:8px 14px; font:inherit; font-weight:600; cursor:pointer; }
+  button.ghost { background:#243447; color:var(--fg); }
+  button.bad { background:var(--bad); color:#1a0606; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  .empty { color:var(--mut); padding:40px; text-align:center; }
+</style>
+</head>
+<body>
+  <div id="side">
+    <h1>ocha <small>remote</small></h1>
+    <div id="sessions"></div>
+    <div id="newbox">
+      <input id="sys" placeholder="system (optional)" style="flex:1;min-width:0">
+      <button id="newbtn">New</button>
+    </div>
+  </div>
+  <div id="main">
+    <div id="bar">
+      <span id="title" class="empty" style="padding:0">No session selected</span>
+      <span id="pill" style="display:none"></span>
+      <span style="flex:1"></span>
+      <button id="cancel" class="ghost" style="display:none">Cancel</button>
+    </div>
+    <div id="gate">
+      <div>Command awaiting approval:</div>
+      <div><code id="gatecmd"></code></div>
+      <div class="row">
+        <button id="approve">Approve</button>
+        <input id="denyreason" placeholder="deny reason" style="flex:1;min-width:0">
+        <button id="deny" class="bad">Deny</button>
+      </div>
+    </div>
+    <div id="log"><div class="empty">Create or pick a session.</div></div>
+    <div id="composer" style="display:none">
+      <textarea id="prompt" placeholder="Message…  (Enter to send)"></textarea>
+      <button id="send">Send</button>
+    </div>
+  </div>
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+let cur = null, es = null, pendingCmd = null, live = "";
+
+async function jget(u){ return (await fetch(u)).json(); }
+async function jpost(u,b){ return fetch(u,{method:"POST",body:JSON.stringify(b||{})}); }
+
+async function refreshSessions(){
+  const list = await jget("/api/sessions");
+  const box = $("#sessions"); box.innerHTML = "";
+  list.sort((a,b)=>a.id<b.id?-1:1).forEach(s=>{
+    const d = document.createElement("div");
+    d.className = "srow" + (s.id===cur?" sel":"");
+    d.innerHTML = `<div class="id">${s.id}</div>`+
+      `<div class="st">${s.config.backend} · ${s.state} · ${s.messages} msg</div>`;
+    d.onclick = ()=>select(s.id);
+    box.appendChild(d);
+  });
+}
+
+function setPill(state){
+  const p = $("#pill"); p.style.display = "";
+  p.textContent = state;
+  p.style.color = state==="awaiting_approval" ? "var(--warn)"
+                 : state==="error" ? "var(--bad)" : "var(--accent)";
+  $("#cancel").style.display = (state==="awaiting_approval"||state==="generating")?"":"none";
+  $("#send").disabled = state!=="idle";
+}
+
+function renderMessages(msgs){
+  const log = $("#log"); log.innerHTML = "";
+  msgs.forEach(m=>{
+    const div = document.createElement("div");
+    div.className = "msg "+m.role;
+    div.innerHTML = `<div class="who">${m.role}</div>`;
+    const b = document.createElement("div"); b.className="body";
+    b.textContent = m.content; div.appendChild(b); log.appendChild(div);
+  });
+  const lv = document.createElement("div"); lv.id="live"; log.appendChild(lv);
+  log.scrollTop = log.scrollHeight;
+}
+
+function showGate(p){
+  pendingCmd = p ? p.cmd_id : null;
+  const g = $("#gate");
+  if(!p){ g.classList.remove("show"); return; }
+  const r = p.request;
+  $("#gatecmd").textContent = `${r.binary} ${(r.args||[]).join(" ")}  —  ${r.description||""}`;
+  g.classList.add("show");
+}
+
+async function reconcile(){
+  if(!cur) return;
+  const s = await jget("/api/sessions/"+cur);
+  setPill(s.state);
+  renderMessages(s.messages);
+  showGate(s.pending_command);
+  refreshSessions();
+}
+
+function openStream(id){
+  if(es) es.close();
+  es = new EventSource(`/api/sessions/${id}/events`);
+  const liveEl = ()=>$("#live");
+  es.addEventListener("snapshot", e=>{ const s=JSON.parse(e.data);
+    setPill(s.state); renderMessages(s.messages); showGate(s.pending_command); });
+  es.addEventListener("state", e=> setPill(JSON.parse(e.data).state));
+  es.addEventListener("token", e=>{ live += JSON.parse(e.data).text;
+    if(liveEl()) liveEl().textContent = live; $("#log").scrollTop=1e9; });
+  es.addEventListener("command_pending", e=> showGate(JSON.parse(e.data)));
+  es.addEventListener("turn_complete", ()=>{ live=""; reconcile(); });
+  es.addEventListener("error", e=>{ try{ alert("error: "+JSON.parse(e.data).message);}catch(_){} });
+}
+
+async function select(id){
+  cur = id; live = "";
+  $("#title").textContent = id; $("#title").className = "";
+  $("#composer").style.display = "flex";
+  openStream(id);
+  await reconcile();
+}
+
+$("#newbtn").onclick = async ()=>{
+  const sys = $("#sys").value.trim();
+  const r = await jpost("/api/sessions", sys?{system:sys}:{});
+  const j = await r.json(); $("#sys").value="";
+  await refreshSessions(); select(j.id);
+};
+$("#send").onclick = async ()=>{
+  const t = $("#prompt").value.trim(); if(!t||!cur) return;
+  $("#prompt").value=""; live="";
+  await jpost(`/api/sessions/${cur}/messages`, {content:t});
+};
+$("#prompt").addEventListener("keydown", e=>{
+  if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); $("#send").click(); }
+});
+$("#approve").onclick = async ()=>{
+  if(!cur||!pendingCmd) return;
+  await jpost(`/api/sessions/${cur}/commands/${pendingCmd}/approve`);
+  showGate(null);
+};
+$("#deny").onclick = async ()=>{
+  if(!cur||!pendingCmd) return;
+  await jpost(`/api/sessions/${cur}/commands/${pendingCmd}/deny`,
+              {reason:$("#denyreason").value||"denied by operator"});
+  $("#denyreason").value=""; showGate(null);
+};
+$("#cancel").onclick = async ()=>{ if(cur) await jpost(`/api/sessions/${cur}/cancel`); };
+
+refreshSessions();
+</script>
+</body>
+</html>
