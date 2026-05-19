@@ -98,3 +98,66 @@ fn test_session_persistence_claude_cli() {
 
     assert_session_recall(&["--backend", "claude-cli", "-m", &model]);
 }
+
+/// M1 golden test: pins the exact agentic side-channel format that
+/// `StdoutObserver` must reproduce after the TurnObserver/CommandApprover
+/// seam refactor. The model's prose is non-deterministic, but the
+/// `[Payload:]/[Executing:]/STDOUT:/[Result:]` lines are a fixed
+/// byte-format contract — if the refactor (or a future one) changed any
+/// of these strings, this fails. eevee-gated like the Ollama e2e.
+#[allow(deprecated)]
+#[test]
+fn test_agentic_side_channel_format_golden() {
+    let host = std::env::var("OCHA_TEST_OLLAMA_HOST").unwrap_or_else(|_| "localhost".to_string());
+    if reqwest::blocking::get(format!("http://{host}:11434")).is_err() {
+        eprintln!("Ollama server not found at {host}:11434, skipping golden test.");
+        return;
+    }
+
+    let assert = Command::cargo_bin("ocha")
+        .unwrap()
+        .arg("-s")
+        .arg(&host)
+        .arg("-m")
+        .arg("gemma3:12b")
+        .arg("--command-per-response")
+        .arg("1")
+        .arg(
+            "You must run a command. Output ONLY a line starting with \
+             !!!OCHA_RUN_CMD followed by \
+             {\"binary\":\"echo\",\"args\":[\"golden-ok\"],\"timeout\":5,\
+             \"description\":\"echo\"} and nothing else.",
+        )
+        .assert()
+        .success();
+
+    let out = String::from_utf8_lossy(&assert.get_output().stdout);
+
+    // Exact prefixes the StdoutObserver emits (byte-format contract).
+    assert!(
+        out.lines().any(|l| l.starts_with("[Payload: ")),
+        "missing `[Payload: ` line:\n{out}"
+    );
+    assert!(
+        out.lines().any(|l| l.starts_with("[Executing: echo ")),
+        "missing `[Executing: echo ` line:\n{out}"
+    );
+    assert!(
+        out.lines().any(|l| l == "STDOUT:"),
+        "missing bare `STDOUT:` line:\n{out}"
+    );
+    assert!(
+        out.lines().any(|l| {
+            l.starts_with("[Result: {")
+                && l.contains("\"status\":0")
+                && l.contains("\"remaining_commands\":")
+                && l.ends_with("}]")
+        }),
+        "missing well-formed `[Result: {{...}}]` line:\n{out}"
+    );
+    // The executed command's stdout is surfaced verbatim.
+    assert!(
+        out.contains("golden-ok"),
+        "command stdout not surfaced:\n{out}"
+    );
+}
