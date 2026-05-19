@@ -445,7 +445,7 @@ fn build_backend(
     // (never the CLI surface). Lets `ocha serve` integration tests run
     // without a real model or network.
     if std::env::var("OCHA_MOCK_BACKEND").as_deref() == Ok("1") {
-        return Ok(Box::new(MockBackend));
+        return Ok(Box::new(MockBackend::default()));
     }
     match cfg.backend {
         BackendKind::Ollama => {
