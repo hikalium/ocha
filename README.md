@@ -122,3 +122,19 @@ ocha -s 192.168.1.50 -p 11434 "Tell me a joke."
 ```bash
 ocha -m llama3 "What is Rust?"
 ```
+
+## Testing
+
+```bash
+cargo test
+```
+
+Unit tests run anywhere. The end-to-end session-persistence test
+(`tests/e2e.rs`) needs a reachable Ollama server; it **skips itself**
+when none is found. By default it looks at `localhost:11434`. Point it
+at a remote server with `OCHA_TEST_OLLAMA_HOST` (the test passes this to
+`ocha` via `-s`):
+
+```bash
+OCHA_TEST_OLLAMA_HOST=eevee cargo test --test e2e -- --nocapture
+```
