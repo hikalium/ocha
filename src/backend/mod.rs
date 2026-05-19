@@ -68,3 +68,60 @@ pub trait Backend {
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, Box<dyn std::error::Error>>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn role_serializes_lowercase() {
+        // Every backend's wire mapping and the persisted session depend on
+        // this exact lowercase spelling.
+        assert_eq!(serde_json::to_string(&Role::System).unwrap(), "\"system\"");
+        assert_eq!(serde_json::to_string(&Role::User).unwrap(), "\"user\"");
+        assert_eq!(
+            serde_json::to_string(&Role::Assistant).unwrap(),
+            "\"assistant\""
+        );
+        assert_eq!(serde_json::to_string(&Role::Tool).unwrap(), "\"tool\"");
+    }
+
+    #[test]
+    fn message_round_trips_through_json() {
+        let m = Message::new(Role::Tool, "result payload");
+        let json = serde_json::to_string(&m).unwrap();
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.role, Role::Tool);
+        assert_eq!(back.content, "result payload");
+    }
+
+    #[test]
+    fn session_round_trips_neutral_message_history() {
+        let s = Session {
+            messages: vec![
+                Message::new(Role::User, "hi"),
+                Message::new(Role::Assistant, "hello"),
+            ],
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.messages.len(), 2);
+        assert_eq!(back.messages[0].role, Role::User);
+        assert_eq!(back.messages[1].content, "hello");
+    }
+
+    #[test]
+    fn legacy_ollama_context_file_deserializes_to_empty_history() {
+        // Documented contract: old `{ "context": [...] }` Ollama-era
+        // sessions are ignored (unknown field) and simply start fresh.
+        let legacy = r#"{ "context": [1, 2, 3, 4] }"#;
+        let s: Session = serde_json::from_str(legacy).unwrap();
+        assert!(s.messages.is_empty());
+    }
+
+    #[test]
+    fn empty_object_deserializes_to_default_session() {
+        let s: Session = serde_json::from_str("{}").unwrap();
+        assert!(s.messages.is_empty());
+    }
+}
