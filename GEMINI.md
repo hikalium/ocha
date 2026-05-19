@@ -34,6 +34,14 @@ This document provides context for AI agents (like Gemini) to assist in the ongo
   keeps ocha's approval gate intact are in the design note's §4
   ("The `claude-cli` backend: a deliberate, contained exception"). Read
   it before touching that backend.
+- **`ocha serve` is a client of the owned loop, not a replacement:**
+  the `TurnObserver`/`CommandApprover` seams in `src/turn.rs` let the
+  *same* `run_turn` be driven by the HTTP/SSE server (`src/serve.rs`)
+  with a remote approve/deny gate that is one `await` on a `oneshot` —
+  no framework, no new external deps. Localhost-only. Full design + API
+  + the §12 dependency-audit gate are in
+  `docs/web-ui-remote-control-design.md`. Do not bypass that loop or the
+  audit when extending serve.
 - **Neutral conversation model:** sessions are a `Vec<Message>` of
   role-tagged text (resent each turn — the lowest common denominator that
   works across Ollama, Anthropic and Gemini). The Ollama-only opaque
@@ -55,6 +63,8 @@ This document provides context for AI agents (like Gemini) to assist in the ongo
 - [x] Multi-turn chat using `/api/chat` (neutral message history)
 - [x] Provider-neutral backend trait (Ollama + Claude)
 - [x] `claude-cli` backend (installed Claude Code CLI; no API key)
+- [x] `ocha serve` — local web UI + remote per-command approval gate
+      (M1–M5; see `docs/web-ui-remote-control-design.md`)
 - [ ] **Gemini backend** (see plan below)
 - [ ] CLI Polish (colorized output, better error handling)
 

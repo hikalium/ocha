@@ -149,17 +149,61 @@ ocha -s 192.168.1.50 -p 11434 "Tell me a joke."
 ocha -m llama3 "What is Rust?"
 ```
 
+## Remote Web UI (`ocha serve`)
+
+`ocha serve` starts a small local HTTP server with a single-page web UI
+for driving conversations remotely — **with a per-command approve/deny
+gate**. The full design rationale and API are in
+[`docs/web-ui-remote-control-design.md`](docs/web-ui-remote-control-design.md).
+
+```bash
+# Top-level flags become the default config for new sessions:
+ocha --backend claude-cli -m haiku serve            # http://127.0.0.1:8765
+ocha --backend ollama -s eevee serve --port 9000
+```
+
+Open the printed `http://127.0.0.1:<port>` in a browser: create a
+session, send prompts, watch tokens stream, and **approve or deny each
+`!!!OCHA_RUN_CMD` before it runs**. The UI is plain HTML/JS embedded in
+the binary — no build step, no external assets.
+
+- **Loopback only, no auth — by design.** The server binds `127.0.0.1`;
+  it is *not* reachable off-box. Anyone with local access can drive the
+  session and approve commands that execute with your privileges — treat
+  the machine as the trust boundary. For remote use, tunnel it
+  (`ssh -L 8765:127.0.0.1:8765 host`); ocha intentionally does not add
+  TLS/auth (see design §7).
+- **Approval gate.** Sessions default to `gated` (remote approve/deny;
+  unanswered commands auto-deny after `OCHA_APPROVAL_TIMEOUT_SECS`,
+  default 600s, and the turn continues — never an indefinite hang). Set
+  `"approval_mode":"auto"` on a session to auto-execute like the CLI.
+- No `ANTHROPIC_API_KEY` is needed if you use the `claude-cli` backend.
+
+**Manual UI smoke checklist** (the API paths are covered by
+`tests/serve.rs`):
+
+1. `ocha --backend claude-cli -m haiku serve`, open the URL.
+2. **New** (optionally a system prompt) → a session appears, selected.
+3. Send "list files here with ls" → tokens stream into the transcript.
+4. An approval banner shows the `ls` command → **Approve** → result
+   appears, the turn continues to completion.
+5. Send another command prompt → **Deny** with a reason → the model is
+   told it was denied and continues.
+6. While a turn/approval is pending, **Cancel** unwinds it.
+
 ## Testing
 
 ```bash
 cargo test
 ```
 
-Unit tests run anywhere. The end-to-end tests (`tests/e2e.rs`) run the
-same provider-neutral session-recall flow (persist a fact in one
-process, recall it in a second) against each backend, and **each one
-skips itself** when its backend is unavailable — so `cargo test` is
-always green offline.
+Unit tests and the `ocha serve` integration tests (`tests/serve.rs`,
+hermetic — spawn the binary with an in-process mock backend, no network)
+run anywhere. The end-to-end tests (`tests/e2e.rs`) run the same
+provider-neutral session-recall flow (persist a fact in one process,
+recall it in a second) against each backend, and **each one skips
+itself** when its backend is unavailable — so `cargo test` is always
+green offline.
 
 | Test | Runs when | Configure with |
 |------|-----------|----------------|

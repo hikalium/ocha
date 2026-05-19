@@ -1,7 +1,9 @@
 # Web UI for remote conversation control + remote command-approval gate
 
 **Date:** 2026-05-19
-**Status:** Design proposal — **not yet implemented**. API + system design only.
+**Status:** **Implemented (v1).** Milestones M1–M5 landed on `main`
+(see §11); this doc remains the authoritative spec + rationale + the §12
+dependency-audit gate for future serve work.
 **Related:** [`docs/llm-interface-layering-and-common-abstraction.md`](llm-interface-layering-and-common-abstraction.md)
 (why ocha owns its loop and the human approval gate); `GEMINI.md`
 ("Architecture Decisions").
@@ -516,6 +518,12 @@ ocha's loop*, never a replacement for it.
 ---
 
 ## 11. Implementation milestones (v1)
+
+> **All five shipped on `main`.** M1 seam refactor · M2 serve skeleton ·
+> M3 HTTP+SSE conversation · M4 remote approval gate · M5 embedded UI +
+> docs. One transitive dep (`httpdate`) was caught by the §12.3 audit in
+> M2, surfaced, and explicitly approved before proceeding — the gate
+> worked exactly as intended.
 
 Five milestones. Each is **contained** (lands on `main`, breaks nothing,
 the CLI keeps working at every step) and **verifiable** (a concrete,
