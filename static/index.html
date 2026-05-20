@@ -10,7 +10,7 @@
           --mut:#8a97a6; --accent:#5db0ff; --warn:#ffb454; --bad:#ff6b6b; }
   * { box-sizing:border-box; }
   body { margin:0; font:14px/1.5 system-ui,sans-serif; background:var(--bg);
-         color:var(--fg); height:100vh; display:flex; }
+         color:var(--fg); height:100vh; height:100dvh; display:flex; }
   #side { width:260px; border-right:1px solid var(--line); display:flex;
           flex-direction:column; background:var(--panel); }
   #side h1 { font-size:15px; margin:0; padding:14px; border-bottom:1px solid var(--line); }
@@ -55,6 +55,25 @@
   button.bad { background:var(--bad); color:#1a0606; }
   button:disabled { opacity:.45; cursor:not-allowed; }
   .empty { color:var(--mut); padding:40px; text-align:center; }
+
+  /* Mobile: stack sidebar above main; 100dvh handles the mobile
+     address-bar; 16px inputs suppress iOS focus-zoom; larger tap
+     targets; respect the iOS home-indicator safe area. */
+  @media (max-width: 700px) {
+    body { flex-direction:column; }
+    #side { width:auto; max-height:40vh; border-right:0;
+            border-bottom:1px solid var(--line); }
+    #side h1 { padding:10px 12px; font-size:14px; }
+    #main { min-height:0; flex:1; }
+    #bar { padding:8px 12px; flex-wrap:wrap; }
+    #log { padding:12px; }
+    #gate { margin:8px; }
+    #composer { padding:10px 12px;
+                padding-bottom:calc(10px + env(safe-area-inset-bottom)); }
+    #prompt { height:48px; }
+    input, select, textarea { font-size:16px; }
+    button { min-height:40px; padding:10px 14px; }
+  }
 </style>
 </head>
 <body>
