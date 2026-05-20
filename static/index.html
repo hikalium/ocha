@@ -107,6 +107,10 @@
                placeholder="ollama port (default 11434)">
         <button id="listbtn" class="ghost" type="button">List available models</button>
         <div id="mout" class="mout"></div>
+        <button id="sysbtn" class="ghost" type="button" disabled
+                title="Send the current system prompt as a message into the active session">
+          Resend system prompt to active chat
+        </button>
       </details>
       <button id="newbtn">New session</button>
     </div>
@@ -161,6 +165,7 @@ function setPill(state){
                  : state==="error" ? "var(--bad)" : "var(--accent)";
   $("#cancel").style.display = (state==="awaiting_approval"||state==="generating")?"":"none";
   $("#send").disabled = state!=="idle";
+  $("#sysbtn").disabled = !cur || state!=="idle";
 }
 
 function renderMessages(msgs){
@@ -214,6 +219,27 @@ async function select(id){
   $("#composer").style.display = "flex";
   openStream(id);
   await reconcile();
+}
+
+// Default system prompt: a concise explanation of ocha's plain-text
+// command protocol, seeded into localStorage only the first time the
+// UI is opened (never overwriting a user-cleared or user-set value).
+const SYSTEM_DEFAULT =
+  "You can run shell commands through ocha's plain-text protocol. " +
+  "To execute one, emit ONE line that begins exactly with `!!!OCHA_RUN_CMD` " +
+  "immediately followed by a compact JSON object with the keys:\n" +
+  "  \"binary\"      string — the executable\n" +
+  "  \"args\"        array of strings — arguments\n" +
+  "  \"timeout\"     integer seconds\n" +
+  "  \"description\" string — short human-readable purpose\n" +
+  "Example:\n" +
+  "  !!!OCHA_RUN_CMD{\"binary\":\"ls\",\"args\":[\"-la\"],\"timeout\":5,\"description\":\"List files\"}\n" +
+  "Put that line on its own; ocha runs the command and replies with " +
+  "{\"status\",\"stdout\",\"stderr\",...} as the next message — continue " +
+  "based on that result. Run one command at a time and verify each " +
+  "result before proceeding.";
+if (localStorage.getItem("ocha.system") === null) {
+  localStorage.setItem("ocha.system", SYSTEM_DEFAULT);
 }
 
 // All session-settings inputs persist across reloads so the "last
@@ -274,6 +300,19 @@ $("#listbtn").addEventListener("click", async ()=>{
   } finally {
     clearTimeout(timer); btn.disabled = false;
   }
+});
+
+// Send the current Settings system prompt as a user message into the
+// active session, to "refresh" the LLM's context with it. Pure client
+// side — uses the existing POST /messages, no server change. The
+// button is enabled only when a session is selected and idle (see
+// setPill); 409 from the server is surfaced as an alert just in case.
+$("#sysbtn").addEventListener("click", async ()=>{
+  if (!cur) { alert("No active session"); return; }
+  const sys = $("#sys").value.trim();
+  if (!sys) { alert("System prompt is empty"); return; }
+  const r = await jpost(`/api/sessions/${cur}/messages`, { content: sys });
+  if (r.status === 409) { alert("Session is busy — try again when idle"); }
 });
 
 $("#newbtn").onclick = async ()=>{
