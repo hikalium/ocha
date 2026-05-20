@@ -93,6 +93,12 @@ struct SessionConfigOut {
     system: Option<String>,
     command_per_response: usize,
     approval_mode: String,
+    // Resolved per-session Ollama transport; populated only when
+    // `backend == "ollama"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
 }
 
 struct SessionRecord {
@@ -119,6 +125,9 @@ struct CreateSessionReq {
     system: Option<String>,
     command_per_response: Option<usize>,
     approval_mode: Option<String>,
+    /// Per-session Ollama transport overrides (ignored by other backends).
+    server: Option<String>,
+    port: Option<u16>,
 }
 
 #[derive(Deserialize)]
@@ -510,13 +519,23 @@ async fn handle(req: Request<Incoming>, state: Arc<AppState>) -> Response<Body> 
             };
             let mut cfg = resolve_backend(&state, req.backend.as_deref());
             cfg.model = req.model.clone().or(cfg.model);
+            // Per-session Ollama transport override (server/port).
+            if let Some(s) = &req.server {
+                cfg.server = s.clone();
+            }
+            if let Some(p) = req.port {
+                cfg.port = p;
+            }
             let d = &state.defaults;
+            let is_ollama = cfg.backend == crate::BackendKind::Ollama;
             let config = SessionConfigOut {
                 backend: backend_name(cfg.backend).to_string(),
                 model: cfg.model.clone(),
                 system: req.system.clone().or_else(|| d.system.clone()),
                 command_per_response: req.command_per_response.unwrap_or(d.command_per_response),
                 approval_mode: req.approval_mode.unwrap_or_else(|| "gated".into()),
+                server: is_ollama.then(|| cfg.server.clone()),
+                port: is_ollama.then_some(cfg.port),
             };
             let n = state.next_id.fetch_add(1, Ordering::SeqCst);
             let id = format!("s_{n:x}");

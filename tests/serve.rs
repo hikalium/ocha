@@ -571,3 +571,71 @@ fn serve_index_ui_hermetic() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[test]
+fn serve_session_ollama_host_override_hermetic() {
+    let (mut child, base) = spawn_server();
+    let c = reqwest::blocking::Client::new();
+
+    // Override.
+    let v: serde_json::Value = c
+        .post(format!("{base}/api/sessions"))
+        .body(r#"{"backend":"ollama","server":"eevee","port":12345}"#)
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let id = v["id"].as_str().unwrap().to_string();
+    let g: serde_json::Value = c
+        .get(format!("{base}/api/sessions/{id}"))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(g["config"]["backend"], "ollama");
+    assert_eq!(g["config"]["server"], "eevee");
+    assert_eq!(g["config"]["port"], 12345);
+
+    // Default ollama session: serve was launched with the CLI default
+    // (`127.0.0.1`), so the resolved server is the CLI default, not None.
+    let v2: serde_json::Value = c
+        .post(format!("{base}/api/sessions"))
+        .body(r#"{"backend":"ollama"}"#)
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let id2 = v2["id"].as_str().unwrap().to_string();
+    let g2: serde_json::Value = c
+        .get(format!("{base}/api/sessions/{id2}"))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(g2["config"]["server"], "127.0.0.1");
+    assert_eq!(g2["config"]["port"], 11434);
+
+    // Non-ollama session: server/port absent (serialize-skip-if-none).
+    let v3: serde_json::Value = c
+        .post(format!("{base}/api/sessions"))
+        .body(r#"{"backend":"claude-cli"}"#)
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let id3 = v3["id"].as_str().unwrap().to_string();
+    let g3: serde_json::Value = c
+        .get(format!("{base}/api/sessions/{id3}"))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert!(
+        g3["config"]["server"].is_null() && g3["config"]["port"].is_null(),
+        "non-ollama session should not expose server/port: {}",
+        g3["config"]
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
