@@ -85,16 +85,16 @@
     <h1>ocha <small>remote</small></h1>
     <div id="sessions"></div>
     <div id="newbox">
-      <select id="be" title="backend (overrides the serve default)">
-        <option value="">backend: default</option>
-        <option value="ollama">ollama</option>
-        <option value="claude">claude</option>
-        <option value="claude-cli">claude-cli</option>
-      </select>
-      <input id="mdl" placeholder="model (optional)">
-      <input id="sys" placeholder="system (optional)">
-      <details id="settings">
-        <summary>Settings · Ollama host</summary>
+      <details id="settings" open>
+        <summary>Session settings</summary>
+        <select id="be" title="backend (overrides the serve default)">
+          <option value="">backend: default</option>
+          <option value="ollama">ollama</option>
+          <option value="claude">claude</option>
+          <option value="claude-cli">claude-cli</option>
+        </select>
+        <input id="mdl" placeholder="model (optional)">
+        <input id="sys" placeholder="system (optional)">
         <input id="ohost" placeholder="ollama host (e.g. eevee)">
         <input id="oport" type="number" min="1" max="65535"
                placeholder="ollama port (default 11434)">
@@ -207,12 +207,20 @@ async function select(id){
   await reconcile();
 }
 
-// Settings (Ollama transport) persist across reloads in localStorage.
-const HOST_KEY = "ocha.ollama.host", PORT_KEY = "ocha.ollama.port";
-$("#ohost").value = localStorage.getItem(HOST_KEY) || "";
-$("#oport").value = localStorage.getItem(PORT_KEY) || "";
-$("#ohost").addEventListener("input", e=> localStorage.setItem(HOST_KEY, e.target.value));
-$("#oport").addEventListener("input", e=> localStorage.setItem(PORT_KEY, e.target.value));
+// All session-settings inputs persist across reloads so the "last
+// choice" sticks. Each form field maps to one localStorage key.
+const STG = [
+  ["#be",    "ocha.backend", "change"],
+  ["#mdl",   "ocha.model",   "input" ],
+  ["#sys",   "ocha.system",  "input" ],
+  ["#ohost", "ocha.ollama.host", "input"],
+  ["#oport", "ocha.ollama.port", "input"],
+];
+for (const [sel, key, ev] of STG) {
+  const el = $(sel);
+  el.value = localStorage.getItem(key) || "";
+  el.addEventListener(ev, e=> localStorage.setItem(key, e.target.value));
+}
 
 $("#newbtn").onclick = async ()=>{
   const body = {};
@@ -224,7 +232,9 @@ $("#newbtn").onclick = async ()=>{
   const oh = $("#ohost").value.trim();        if (oh) body.server = oh;
   const op = parseInt($("#oport").value, 10); if (Number.isFinite(op)) body.port = op;
   const r = await jpost("/api/sessions", body);
-  const j = await r.json(); $("#sys").value=""; $("#mdl").value="";
+  const j = await r.json();
+  // Settings are intentionally NOT cleared — they're the "last choice"
+  // that pre-fills the next session.
   await refreshSessions(); select(j.id);
 };
 $("#send").onclick = async ()=>{
