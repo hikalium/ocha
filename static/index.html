@@ -25,6 +25,10 @@
   #newbox { padding:12px; border-top:1px solid var(--line);
             display:flex; flex-direction:column; gap:6px; }
   #newbox select, #newbox input { width:100%; }
+  #settings { display:flex; flex-direction:column; gap:6px; }
+  #settings summary { cursor:pointer; color:var(--mut); font-size:12px;
+                      padding:2px 0; user-select:none; }
+  #settings summary:hover { color:var(--fg); }
   #main { flex:1; display:flex; flex-direction:column; min-width:0; }
   #bar { padding:10px 16px; border-bottom:1px solid var(--line);
           display:flex; align-items:center; gap:12px; }
@@ -89,6 +93,12 @@
       </select>
       <input id="mdl" placeholder="model (optional)">
       <input id="sys" placeholder="system (optional)">
+      <details id="settings">
+        <summary>Settings · Ollama host</summary>
+        <input id="ohost" placeholder="ollama host (e.g. eevee)">
+        <input id="oport" type="number" min="1" max="65535"
+               placeholder="ollama port (default 11434)">
+      </details>
       <button id="newbtn">New session</button>
     </div>
   </div>
@@ -197,11 +207,22 @@ async function select(id){
   await reconcile();
 }
 
+// Settings (Ollama transport) persist across reloads in localStorage.
+const HOST_KEY = "ocha.ollama.host", PORT_KEY = "ocha.ollama.port";
+$("#ohost").value = localStorage.getItem(HOST_KEY) || "";
+$("#oport").value = localStorage.getItem(PORT_KEY) || "";
+$("#ohost").addEventListener("input", e=> localStorage.setItem(HOST_KEY, e.target.value));
+$("#oport").addEventListener("input", e=> localStorage.setItem(PORT_KEY, e.target.value));
+
 $("#newbtn").onclick = async ()=>{
   const body = {};
   const be = $("#be").value;            if (be)  body.backend = be;
   const mdl = $("#mdl").value.trim();   if (mdl) body.model   = mdl;
   const sys = $("#sys").value.trim();   if (sys) body.system  = sys;
+  // Ollama transport override; sent only when the user actually set
+  // it. The API ignores it for non-ollama backends.
+  const oh = $("#ohost").value.trim();        if (oh) body.server = oh;
+  const op = parseInt($("#oport").value, 10); if (Number.isFinite(op)) body.port = op;
   const r = await jpost("/api/sessions", body);
   const j = await r.json(); $("#sys").value=""; $("#mdl").value="";
   await refreshSessions(); select(j.id);
