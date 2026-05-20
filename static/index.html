@@ -29,6 +29,13 @@
   #settings summary { cursor:pointer; color:var(--mut); font-size:12px;
                       padding:2px 0; user-select:none; }
   #settings summary:hover { color:var(--fg); }
+  .mout { font:12.5px/1.4 ui-monospace,monospace; color:var(--mut);
+          white-space:pre-wrap; max-height:140px; overflow:auto;
+          padding:2px 0; min-height:0; }
+  .mout.err { color:var(--bad); }
+  .mout.ok  { color:var(--fg); }
+  .mout ul  { margin:2px 0 0; padding-left:18px; }
+  .mout .det { color:var(--mut); }
   #main { flex:1; display:flex; flex-direction:column; min-width:0; }
   #bar { padding:10px 16px; border-bottom:1px solid var(--line);
           display:flex; align-items:center; gap:12px; }
@@ -98,6 +105,8 @@
         <input id="ohost" placeholder="ollama host (e.g. eevee)">
         <input id="oport" type="number" min="1" max="65535"
                placeholder="ollama port (default 11434)">
+        <button id="listbtn" class="ghost" type="button">List available models</button>
+        <div id="mout" class="mout"></div>
       </details>
       <button id="newbtn">New session</button>
     </div>
@@ -221,6 +230,51 @@ for (const [sel, key, ev] of STG) {
   el.value = localStorage.getItem(key) || "";
   el.addEventListener(ev, e=> localStorage.setItem(key, e.target.value));
 }
+
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, c =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+// List models honoring the current Settings (backend + ollama host/port).
+// 3s AbortController timeout so the button always resolves to a result,
+// "Timed out after 3s", or "Error: …".
+$("#listbtn").addEventListener("click", async ()=>{
+  const out = $("#mout"), btn = $("#listbtn");
+  out.className = "mout"; out.textContent = "Listing models…";
+  const p = new URLSearchParams();
+  const be = $("#be").value;                  if (be) p.set("backend", be);
+  const oh = $("#ohost").value.trim();        if (oh) p.set("server", oh);
+  const op = parseInt($("#oport").value, 10); if (Number.isFinite(op)) p.set("port", op);
+  const url = "/api/models" + (p.toString() ? "?" + p : "");
+  const ctrl = new AbortController();
+  const timer = setTimeout(()=> ctrl.abort(), 3000);
+  btn.disabled = true;
+  try {
+    const r = await fetch(url, { signal: ctrl.signal });
+    if (!r.ok) {
+      let msg = "HTTP " + r.status;
+      try { msg = (await r.json()).error || msg; } catch(_) {}
+      out.className = "mout err"; out.textContent = "Error: " + msg;
+      return;
+    }
+    const j = await r.json();
+    const ms = j.models || [];
+    if (!ms.length) { out.textContent = "No models reported."; return; }
+    out.className = "mout ok";
+    out.innerHTML = "<ul>" + ms.map(m =>
+      "<li>" + escapeHtml(m.name)
+      + (m.detail ? ` <span class="det">${escapeHtml(m.detail)}</span>` : "")
+      + "</li>").join("") + "</ul>";
+  } catch (e) {
+    out.className = "mout err";
+    out.textContent = (e.name === "AbortError")
+      ? "Timed out after 3s"
+      : ("Error: " + (e.message || e));
+  } finally {
+    clearTimeout(timer); btn.disabled = false;
+  }
+});
 
 $("#newbtn").onclick = async ()=>{
   const body = {};
