@@ -11,11 +11,12 @@
   * { box-sizing:border-box; }
   body { margin:0; font:14px/1.5 system-ui,sans-serif; background:var(--bg);
          color:var(--fg); height:100vh; height:100dvh; display:flex; }
-  #side { width:260px; border-right:1px solid var(--line); display:flex;
-          flex-direction:column; background:var(--panel); }
+  /* Whole sidebar scrolls as one — simpler than nested scroll regions
+     and survives an expanded Settings disclosure without breaking. */
+  #side { width:260px; border-right:1px solid var(--line);
+          background:var(--panel); overflow-y:auto; }
   #side h1 { font-size:15px; margin:0; padding:14px; border-bottom:1px solid var(--line); }
   #side h1 small { color:var(--mut); font-weight:400; }
-  #sessions { flex:1; overflow:auto; }
   .srow { padding:10px 14px; cursor:pointer; border-bottom:1px solid var(--line);
           font-size:13px; }
   .srow:hover { background:#222b36; }
@@ -51,6 +52,11 @@
   .msg.tool .body { background:#0c0f13; border:1px solid var(--line);
                     border-radius:6px; padding:8px; color:var(--mut); }
   #live { white-space:pre-wrap; color:var(--fg); opacity:.9; }
+  /* Per-turn verbose debug: every SSE event lands here as a muted
+     monospace line; cleared by reconcile() when the turn completes. */
+  .dbg { font:11px/1.4 ui-monospace,monospace; color:var(--mut);
+         white-space:pre-wrap; word-break:break-all;
+         margin:0 0 2px; opacity:.7; }
   #gate { margin:0 16px; padding:12px; border:1px solid var(--warn);
           border-radius:8px; background:#241f12; display:none; }
   #gate.show { display:block; }
@@ -92,7 +98,7 @@
     <h1>ocha <small>remote</small></h1>
     <div id="sessions"></div>
     <div id="newbox">
-      <details id="settings" open>
+      <details id="settings">
         <summary>Session settings</summary>
         <select id="be" title="backend (overrides the serve default)">
           <option value="">backend: default</option>
@@ -199,18 +205,55 @@ async function reconcile(){
   refreshSessions();
 }
 
+// Verbose debug: every SSE event lands in #log as a muted line so the
+// transcript shows the full protocol flow (cleared per turn by
+// reconcile()). Insert above #live so streamed tokens stay last.
+function logDbg(ev, data){
+  const log = $("#log"); if (!log) return;
+  const ts = new Date().toISOString().slice(11, 23);
+  const d = document.createElement("div"); d.className = "dbg";
+  d.textContent = `[${ts}] ${ev}: ${data || ""}`;
+  const live = $("#live");
+  if (live) live.parentNode.insertBefore(d, live); else log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
+}
+
+// Append one message bubble directly (used for immediate local echo of
+// what the user just sent; reconcile() will re-render canonically when
+// the turn completes).
+function appendMsg(role, content){
+  const log = $("#log");
+  const div = document.createElement("div"); div.className = "msg "+role;
+  div.innerHTML = `<div class="who">${role}</div>`;
+  const b = document.createElement("div"); b.className = "body";
+  b.textContent = content;
+  div.appendChild(b);
+  const live = $("#live");
+  if (live) live.parentNode.insertBefore(div, live); else log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
 function openStream(id){
   if(es) es.close();
   es = new EventSource(`/api/sessions/${id}/events`);
-  const liveEl = ()=>$("#live");
-  es.addEventListener("snapshot", e=>{ const s=JSON.parse(e.data);
+  // Wrap so every event is logged for debug before its specific handler.
+  const on = (type, fn) => es.addEventListener(type, e => { logDbg(type, e.data); fn(e); });
+  const liveEl = () => $("#live");
+  on("snapshot", e => { const s = JSON.parse(e.data);
     setPill(s.state); renderMessages(s.messages); showGate(s.pending_command); });
-  es.addEventListener("state", e=> setPill(JSON.parse(e.data).state));
-  es.addEventListener("token", e=>{ live += JSON.parse(e.data).text;
-    if(liveEl()) liveEl().textContent = live; $("#log").scrollTop=1e9; });
-  es.addEventListener("command_pending", e=> showGate(JSON.parse(e.data)));
-  es.addEventListener("turn_complete", ()=>{ live=""; reconcile(); });
-  es.addEventListener("error", e=>{ try{ alert("error: "+JSON.parse(e.data).message);}catch(_){} });
+  on("state", e => setPill(JSON.parse(e.data).state));
+  on("token", e => { live += JSON.parse(e.data).text;
+    if (liveEl()) liveEl().textContent = live; $("#log").scrollTop = 1e9; });
+  on("command_pending", e => showGate(JSON.parse(e.data)));
+  on("turn_complete", () => { live = ""; reconcile(); });
+  on("error", e => { try { alert("error: " + JSON.parse(e.data).message); } catch(_){} });
+  // Capture-for-debug-only events (rendering is owned by reconcile +
+  // showGate above; we just want them in the verbose log).
+  on("ping",              () => {});
+  on("reminder",          () => {});
+  on("message",           () => {});
+  on("command_executing", () => {});
+  on("command_result",    () => {});
 }
 
 async function select(id){
@@ -311,6 +354,7 @@ $("#sysbtn").addEventListener("click", async ()=>{
   if (!cur) { alert("No active session"); return; }
   const sys = $("#sys").value.trim();
   if (!sys) { alert("System prompt is empty"); return; }
+  appendMsg("user", sys);                            // immediate echo
   const r = await jpost(`/api/sessions/${cur}/messages`, { content: sys });
   if (r.status === 409) { alert("Session is busy — try again when idle"); }
 });
@@ -333,6 +377,7 @@ $("#newbtn").onclick = async ()=>{
 $("#send").onclick = async ()=>{
   const t = $("#prompt").value.trim(); if(!t||!cur) return;
   $("#prompt").value=""; live="";
+  appendMsg("user", t);                              // immediate echo
   await jpost(`/api/sessions/${cur}/messages`, {content:t});
 };
 $("#prompt").addEventListener("keydown", e=>{
