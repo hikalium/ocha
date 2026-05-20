@@ -22,7 +22,9 @@
   .srow.sel { background:#243447; border-left:3px solid var(--accent); }
   .srow .id { font-family:ui-monospace,monospace; }
   .srow .st { color:var(--mut); font-size:12px; }
-  #newbox { padding:12px; border-top:1px solid var(--line); display:flex; gap:6px; }
+  #newbox { padding:12px; border-top:1px solid var(--line);
+            display:flex; flex-direction:column; gap:6px; }
+  #newbox select, #newbox input { width:100%; }
   #main { flex:1; display:flex; flex-direction:column; min-width:0; }
   #bar { padding:10px 16px; border-bottom:1px solid var(--line);
           display:flex; align-items:center; gap:12px; }
@@ -60,8 +62,15 @@
     <h1>ocha <small>remote</small></h1>
     <div id="sessions"></div>
     <div id="newbox">
-      <input id="sys" placeholder="system (optional)" style="flex:1;min-width:0">
-      <button id="newbtn">New</button>
+      <select id="be" title="backend (overrides the serve default)">
+        <option value="">backend: default</option>
+        <option value="ollama">ollama</option>
+        <option value="claude">claude</option>
+        <option value="claude-cli">claude-cli</option>
+      </select>
+      <input id="mdl" placeholder="model (optional)">
+      <input id="sys" placeholder="system (optional)">
+      <button id="newbtn">New session</button>
     </div>
   </div>
   <div id="main">
@@ -170,9 +179,12 @@ async function select(id){
 }
 
 $("#newbtn").onclick = async ()=>{
-  const sys = $("#sys").value.trim();
-  const r = await jpost("/api/sessions", sys?{system:sys}:{});
-  const j = await r.json(); $("#sys").value="";
+  const body = {};
+  const be = $("#be").value;            if (be)  body.backend = be;
+  const mdl = $("#mdl").value.trim();   if (mdl) body.model   = mdl;
+  const sys = $("#sys").value.trim();   if (sys) body.system  = sys;
+  const r = await jpost("/api/sessions", body);
+  const j = await r.json(); $("#sys").value=""; $("#mdl").value="";
   await refreshSessions(); select(j.id);
 };
 $("#send").onclick = async ()=>{
