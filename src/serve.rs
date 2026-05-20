@@ -484,11 +484,23 @@ async fn handle(req: Request<Incoming>, state: Arc<AppState>) -> Response<Body> 
         ),
 
         (&Method::GET, ["api", "models"]) => {
-            let backend = query
-                .split('&')
-                .find_map(|kv| kv.strip_prefix("backend="))
-                .map(|s| s.to_string());
-            let cfg = resolve_backend(&state, backend.as_deref());
+            let qparam = |k: &str| -> Option<String> {
+                let prefix = format!("{k}=");
+                query
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix(&prefix))
+                    .map(|s| s.to_string())
+            };
+            let backend = qparam("backend");
+            let mut cfg = resolve_backend(&state, backend.as_deref());
+            // Mirror the session override path so the UI's
+            // "list models" can target the per-session Ollama host.
+            if let Some(s) = qparam("server") {
+                cfg.server = s;
+            }
+            if let Some(p) = qparam("port").and_then(|s| s.parse::<u16>().ok()) {
+                cfg.port = p;
+            }
             // Resolve the (non-Send) build Result *before* any await so
             // the connection future stays Send.
             let backend = match build_backend(&cfg, reqwest::Client::new()) {

@@ -639,3 +639,40 @@ fn serve_session_ollama_host_override_hermetic() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[test]
+fn serve_models_with_overrides_hermetic() {
+    let (mut child, base) = spawn_server();
+    let c = reqwest::blocking::Client::new();
+
+    // Plain (no params) — the existing path.
+    let m1: serde_json::Value = c
+        .get(format!("{base}/api/models"))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(m1["models"][0]["name"], "mock-model");
+
+    // With backend + server + port overrides; the mock returns the same
+    // list, but the request must parse cleanly and not 4xx/5xx.
+    let r = c
+        .get(format!(
+            "{base}/api/models?backend=ollama&server=eevee&port=1234"
+        ))
+        .send()
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let m2: serde_json::Value = r.json().unwrap();
+    assert_eq!(m2["models"][0]["name"], "mock-model");
+
+    // Unknown backend value falls back to defaults (still 200).
+    let r3 = c
+        .get(format!("{base}/api/models?backend=nope"))
+        .send()
+        .unwrap();
+    assert_eq!(r3.status().as_u16(), 200);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
